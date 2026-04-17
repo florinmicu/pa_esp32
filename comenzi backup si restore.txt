@@ -1,0 +1,171 @@
+BACKUP
+
+
+cat > ~/make_safe_backup.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TS=$(date +%Y%m%d_%H%M%S)
+USER_NAME="${SUDO_USER:-$USER}"
+HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+
+BK_DIR="/tmp/backup_moode_esp_FULL_${TS}"
+BK_TAR="/tmp/backup_moode_esp_FULL_${TS}.tar.gz"
+
+mkdir -p "$BK_DIR"
+
+# 1) Scripturi/proiect
+cp -a "$HOME_DIR/bridge" "$BK_DIR/" 2>/dev/null || true
+
+# 2) systemd
+mkdir -p "$BK_DIR/systemd"
+cp -a /etc/systemd/system/moode-*.service "$BK_DIR/systemd/" 2>/dev/null || true
+cp -a /etc/systemd/system/moode-*.timer "$BK_DIR/systemd/" 2>/dev/null || true
+cp -a /etc/systemd/system/mpd*.service "$BK_DIR/systemd/" 2>/dev/null || true
+
+# 3) config audio/mpd/cava
+mkdir -p "$BK_DIR/etc"
+cp -a /etc/mpd.conf "$BK_DIR/etc/" 2>/dev/null || true
+cp -a /etc/asound.conf "$BK_DIR/etc/" 2>/dev/null || true
+cp -a "$HOME_DIR/.config/cava" "$BK_DIR/" 2>/dev/null || true
+
+# 4) catalog MPD (NU muzica NAS)
+mkdir -p "$BK_DIR/varlib"
+cp -a /var/lib/mpd "$BK_DIR/varlib/" 2>/dev/null || true
+
+# 5) librarii Python (fizic)
+mkdir -p "$BK_DIR/python-libs-user"
+cp -a "$HOME_DIR/.local/lib" "$BK_DIR/python-libs-user/" 2>/dev/null || true
+
+mkdir -p "$BK_DIR/python-libs-system"
+cp -a /usr/lib/python3/dist-packages "$BK_DIR/python-libs-system/" 2>/dev/null || true
+cp -a /usr/local/lib/python3.*/dist-packages "$BK_DIR/python-libs-system/" 2>/dev/null || true
+cp -a /usr/local/lib/python3.*/site-packages "$BK_DIR/python-libs-system/" 2>/dev/null || true
+
+# 6) manifeste pachete
+mkdir -p "$BK_DIR/manifests"
+dpkg --get-selections > "$BK_DIR/manifests/dpkg_selections.txt" || true
+apt-mark showmanual > "$BK_DIR/manifests/apt_manual.txt" || true
+python3 -m pip freeze > "$BK_DIR/manifests/pip_freeze_user.txt" 2>/dev/null || true
+python3 -m pip freeze --break-system-packages > "$BK_DIR/manifests/pip_freeze_system_try.txt" 2>/dev/null || true
+
+# 7) status util
+systemctl list-unit-files > "$BK_DIR/manifests/systemd_units_all.txt" 2>/dev/null || true
+systemctl status moode-bridge.service --no-pager > "$BK_DIR/manifests/moode-bridge.status.txt" 2>/dev/null || true
+mpc status > "$BK_DIR/manifests/mpc_status.txt" 2>/dev/null || true
+mpc outputs > "$BK_DIR/manifests/mpc_outputs.txt" 2>/dev/null || true
+
+# 8) arhivare
+tar -czf "$BK_TAR" -C /tmp "$(basename "$BK_DIR")"
+
+# 9) mutare in home user + ownership corect pentru WinSCP
+mv "$BK_TAR" "$HOME_DIR/"
+chown "$USER_NAME:$USER_NAME" "$HOME_DIR/$(basename "$BK_TAR")"
+
+# 10) curatare folder temporar
+rm -rf "$BK_DIR"
+
+echo "OK: $HOME_DIR/$(basename "$BK_TAR")"
+ls -lh "$HOME_DIR/$(basename "$BK_TAR")"
+EOF
+
+chmod +x ~/make_safe_backup.sh
+sudo ~/make_safe_backup.sh
+
+RESTORE
+
+
+# ===== RESTORE COMPLET (din backup_moode_esp_FULL_*.tar.gz) =====
+# Ruleaza pe RPi. Inlocuieste numele arhivei cu al tau.
+set -euo pipefail
+
+BK_TAR="$HOME/backup_moode_esp_FULL_YYYYMMDD_HHMMSS.tar.gz"
+REST="/tmp/restore_moode_esp"
+
+rm -rf "$REST"
+mkdir -p "$REST"
+tar -xzf "$BK_TAR" -C "$REST"
+
+BK_DIR="$(find "$REST" -maxdepth 1 -type d -name 'backup_moode_esp_FULL_*' | head -n1)"
+if [ -z "${BK_DIR:-}" ]; then
+  echo "Nu gasesc folderul de backup in arhiva."
+  exit 1
+fi
+
+echo "Restore din: $BK_DIR"
+
+# 1) Opreste servicii care pot tine fisiere ocupate
+sudo systemctl stop moode-bridge.service 2>/dev/null || true
+sudo systemctl stop moode-bridge-delayed.timer 2>/dev/null || true
+sudo systemctl stop moode-bridge-delayed.service 2>/dev/null || true
+sudo systemctl stop mpd.service 2>/dev/null || true
+
+# 2) Restore scripturi/proiect
+if [ -d "$BK_DIR/bridge" ]; then
+  rm -rf "$HOME/bridge"
+  cp -a "$BK_DIR/bridge" "$HOME/"
+fi
+
+# 3) Restore systemd units
+if [ -d "$BK_DIR/systemd" ]; then
+  sudo cp -a "$BK_DIR/systemd/"* /etc/systemd/system/ 2>/dev/null || true
+fi
+
+# 4) Restore config audio/mpd/cava
+[ -f "$BK_DIR/etc/mpd.conf" ] && sudo cp -a "$BK_DIR/etc/mpd.conf" /etc/mpd.conf
+[ -f "$BK_DIR/etc/asound.conf" ] && sudo cp -a "$BK_DIR/etc/asound.conf" /etc/asound.conf
+if [ -d "$BK_DIR/cava" ]; then
+  mkdir -p "$HOME/.config"
+  rm -rf "$HOME/.config/cava"
+  cp -a "$BK_DIR/cava" "$HOME/.config/"
+fi
+
+# 5) Restore catalog MPD (NU muzica NAS)
+if [ -d "$BK_DIR/varlib/mpd" ]; then
+  sudo rm -rf /var/lib/mpd
+  sudo cp -a "$BK_DIR/varlib/mpd" /var/lib/
+fi
+
+# 6) Restore librarii Python user (fizic)
+if [ -d "$BK_DIR/python-libs-user/lib" ]; then
+  mkdir -p "$HOME/.local"
+  rm -rf "$HOME/.local/lib"
+  cp -a "$BK_DIR/python-libs-user/lib" "$HOME/.local/"
+fi
+
+# 7) Restore librarii Python system (fizic) - optional, dar complet
+if [ -d "$BK_DIR/python-libs-system/dist-packages" ]; then
+  sudo cp -a "$BK_DIR/python-libs-system/dist-packages" /usr/lib/python3/
+fi
+# daca exista copii din /usr/local
+if ls "$BK_DIR/python-libs-system"/python3.* >/dev/null 2>&1; then
+  for d in "$BK_DIR/python-libs-system"/python3.*; do
+    [ -d "$d/dist-packages" ] && sudo cp -a "$d/dist-packages" "$(echo "$d" | sed "s|$BK_DIR/python-libs-system|/usr/local/lib|")/"
+    [ -d "$d/site-packages" ] && sudo cp -a "$d/site-packages" "$(echo "$d" | sed "s|$BK_DIR/python-libs-system|/usr/local/lib|")/"
+  done
+fi
+
+# 8) Permisiuni
+sudo chown -R "$USER:$USER" "$HOME/bridge" 2>/dev/null || true
+sudo chown -R "$USER:$USER" "$HOME/.config/cava" 2>/dev/null || true
+sudo chown -R "$USER:$USER" "$HOME/.local/lib" 2>/dev/null || true
+sudo chown -R mpd:audio /var/lib/mpd 2>/dev/null || true
+sudo chmod 644 /etc/mpd.conf 2>/dev/null || true
+
+# 9) Reactivare servicii
+sudo systemctl daemon-reload
+sudo systemctl enable moode-bridge.service 2>/dev/null || true
+sudo systemctl enable moode-bridge-delayed.timer 2>/dev/null || true
+sudo systemctl start mpd.service
+sudo systemctl restart moode-bridge.service
+sudo systemctl start moode-bridge-delayed.timer 2>/dev/null || true
+
+# 10) Verificare rapida
+echo "=== STATUS ==="
+systemctl is-active mpd.service || true
+systemctl is-active moode-bridge.service || true
+systemctl is-active moode-bridge-delayed.timer || true
+mpc status || true
+mpc outputs || true
+
+echo "Restore complet terminat."
