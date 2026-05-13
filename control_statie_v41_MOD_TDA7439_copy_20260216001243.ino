@@ -3294,6 +3294,13 @@ void initRpiSerial() {
 #endif
   Serial2.begin(RPI_SERIAL_BAUD, SERIAL_8N1, RPI_SERIAL_RX_PIN, RPI_SERIAL_TX_PIN);
   rpiRxLen = 0;
+  // Drop stale RX (noise, partial lines from mux/UART glitches) so the first parsed line is a clean STAT|.
+  {
+    int flushCap = 0;
+    while (Serial2.available() && flushCap++ < 4096) {
+      (void)Serial2.read();
+    }
+  }
   // Treat "no STAT yet" as quiet since boot — avoids `(millis()-0) >= 1800` looking like infinite RX silence.
   lastRpiRxMs = millis();
   Serial.printf("[RPI] Serial bridge initialized RX=%d TX=%d @%d\n", RPI_SERIAL_RX_PIN, RPI_SERIAL_TX_PIN, RPI_SERIAL_BAUD);
@@ -3599,6 +3606,8 @@ void pollPcBridge() {
 }
 
 void processRpiLine(const char *line) {
+  if (!line) return;
+  line = skipSpaces(line);
   if (strncmp(line, "STAT|", 5) != 0) return;
   // While the UI is in PC/foobar mode, the Raspberry UART bridge may still stream STAT lines.
   // Do not let those updates clobber the RPi metadata buffers (they are reused for PC title ticker).
@@ -3667,25 +3676,13 @@ void processRpiLine(const char *line) {
 
 void pollRpiSerial() {
   if (!rpiUartEnabled) return;
-  // Decouple non-RPi sources from the Raspberry bridge state/startup.
-  // Outside standby/RPi context we only drain a tiny amount of UART RX and skip GET polling/command retries.
-  if (!isRpiContextActive()) {
-    for (int iter = 0; iter < 16 && Serial2.available(); iter++) {
-      char c = (char)Serial2.read();
-      if (c == '\n') rpiRxLen = 0;
-      else if (c != '\r' && rpiRxLen < (sizeof(rpiRxLine) - 1)) rpiRxLine[rpiRxLen++] = c;
-    }
-    if (rpiConnected && (millis() - lastRpiRxMs >= 5000UL)) {
-      rpiConnected = false;
-    }
-    return;
-  }
+  // UART is only enabled when isRpiContextActive() (see tickSourceTransitionsAndBridgeIo); no split-path drain needed.
   // #region agent log: H3 measure pollRpiSerial spikes
   uint32_t t0 = micros();
   // #endregion
-  // Don't spend unbounded time draining a large UART burst in one loop() tick.
-  for (int iter = 0; iter < 48 && Serial2.available(); iter++) {
-    if ((iter & 15) == 15) yield();
+  // Drain enough per tick to stay ahead of bridge keepalives (avoid RX overflow / split STAT lines).
+  for (int iter = 0; iter < 320 && Serial2.available(); iter++) {
+    if ((iter & 31) == 31) yield();
     char c = (char)Serial2.read();
     if (c == '\r') continue;
     if (c == '\n') {
@@ -6940,19 +6937,46 @@ void setTDA7439InputForSource(int sursa) {
       break;
     default: tdaInput = 1; break;
   }
+  // PCD (5) => mux „Amanero/PC dig”; RPI (3), PCA (4), rest => mux „Raspberry” (vezi PC_DIGITAL_STATUS_AMANERO_LEVEL_HIGH).
+  const bool wantAmaneroI2s = (sursa == 5);
   // Optional external mux/relay for PC routing (XMOS vs analog).
   if (PC_AUDIO_SEL_PIN >= 0) {
     const bool wantAnalog = (sursa == 5); // PCD = analog path
     const bool level = PC_AUDIO_SEL_ACTIVE_HIGH ? wantAnalog : !wantAnalog;
     digitalWrite(PC_AUDIO_SEL_PIN, level ? HIGH : LOW);
   }
+  bool i2sPinLevelHigh = false;
+  bool i2sMuxActive = false;
   if (PC_DIGITAL_STATUS_PIN >= 0) {
-    const bool wantAmanero = (sursa == 5); // PCD => Amanero, everything else (incl. RPI) => Raspberry
-    const bool level = PC_DIGITAL_STATUS_AMANERO_LEVEL_HIGH ? wantAmanero : !wantAmanero;
-    digitalWrite(PC_DIGITAL_STATUS_PIN, level ? HIGH : LOW);
+    i2sMuxActive = true;
+    i2sPinLevelHigh = PC_DIGITAL_STATUS_AMANERO_LEVEL_HIGH ? wantAmaneroI2s : !wantAmaneroI2s;
+    digitalWrite(PC_DIGITAL_STATUS_PIN, i2sPinLevelHigh ? HIGH : LOW);
   }
   tda7439.setInput(tdaInput);
   noteTdaWrite("input", tdaInput, -1);
+
+  if (Serial.availableForWrite() >= 120) {
+    Serial.printf("[TDA+I2S] sursa=%d  TDA7439 intrare=IN%d", sursa, tdaInput);
+    if (i2sMuxActive) {
+      // Un singur mesaj coerent: nivelul pinului SI legatura cu mux (evita confuzia „HIGH=Amanero” repetat la fiecare linie).
+      Serial.printf("  I2S GPIO%d=%s", PC_DIGITAL_STATUS_PIN, i2sPinLevelHigh ? "HIGH" : "LOW");
+      if (PC_DIGITAL_STATUS_AMANERO_LEVEL_HIGH) {
+        Serial.printf(" => mux: %s (regula: pin HIGH=Amanero, pin LOW=Raspberry)",
+                      wantAmaneroI2s ? "Amanero/PC digital" : "Raspberry Pi");
+      } else {
+        Serial.printf(" => mux: %s (regula: pin LOW=Amanero, pin HIGH=Raspberry)",
+                      wantAmaneroI2s ? "Amanero/PC digital" : "Raspberry Pi");
+      }
+    } else {
+      Serial.print("  I2S mux: dezactivat (PC_DIGITAL_STATUS_PIN=-1)");
+    }
+    if (PC_AUDIO_SEL_PIN >= 0) {
+      const bool wantAnalog = (sursa == 5);
+      const bool alev = PC_AUDIO_SEL_ACTIVE_HIGH ? wantAnalog : !wantAnalog;
+      Serial.printf("  PC_AUDIO_SEL GPIO%d=%s", PC_AUDIO_SEL_PIN, alev ? "HIGH" : "LOW");
+    }
+    Serial.println();
+  }
 }
 
 // Apply all persisted audio settings to TDA7439 for current source
@@ -7060,4 +7084,3 @@ void tda7439Send(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
   delay(2);
 }
-iulghkjbh

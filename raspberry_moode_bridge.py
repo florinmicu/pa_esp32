@@ -414,7 +414,7 @@ def main():
                 last_state_tx = time.time()
                 ensure_visualizer_output_enabled(True)
                 burst_until = time.time() + 2.0
-            elif line == "GET":
+            elif line.upper() == "GET":
                 if (time.time() - last_state_refresh) > 0.7:
                     state_line_cache = get_state_line()
                     last_state_refresh = time.time()
