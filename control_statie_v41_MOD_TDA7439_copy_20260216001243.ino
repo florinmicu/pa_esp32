@@ -1,7 +1,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <time.h>
 #include <Arduino.h>
+#include <stdio.h>
+#include <string.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -22,10 +25,42 @@
 #if defined(ARDUINO_ARCH_ESP32)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_system.h"
 #endif
 
+// Debug logging can make WebUI feel sluggish (Serial can block).
+// Set to 1 only while diagnosing.
+#ifndef DEBUG_SERIAL_LOGS
+#define DEBUG_SERIAL_LOGS 0
+#endif
+
+// PC bridge polling can be frequent; keep its Serial logs off by default.
+// Turn on only while debugging PC bridge networking.
+#ifndef DEBUG_PC_BRIDGE_SERIAL
+#define DEBUG_PC_BRIDGE_SERIAL 0
+#endif
+
+// 1 = PC /state polling in FreeRTOS task (recommended; avoids long HTTP in loop contending with WebServer WiFi).
+// 0 = poll from main loop via tickSourceTransitionsAndBridgeIo() (debug only; can add multi-second /api/v2 lag).
+#ifndef ENABLE_PC_BRIDGE_POLLING
+#define ENABLE_PC_BRIDGE_POLLING 0
+#endif
+
+// USB Serial: la runtime, printf-urile pot bloca loop-ul dacă bufferul e plin și încetinesc Web UI-ul.
+// Păstrăm loguri utile la boot: setup(), connectToWiFi(), initRpiSerial, scanI2CBus, test TDA7439, OTA callbacks.
+// Web UI: POST-uri scurte; starea se reîncarcă cu refreshState (un singur GET în zbor, coalesce) + kickSync după mutații
+// (EQ/volum/frecvență se aplică în loop, nu în handler HTTP — altfel UI „nu se actualizează” fără refresh).
 
 #define TDA7439_ADDRESS 0x44
+
+// Web UI server/task enable.
+#define ENABLE_WEBUI 1
+
+// PC-only mode: disable all Raspberry/Moode UART bridge work.
+// Useful when diagnosing sluggish WebUI / foobar bridge issues.
+#ifndef PC_ONLY_FOOBAR
+#define PC_ONLY_FOOBAR 0
+#endif
 
 // Forward declarations
 class FMRadioController;
@@ -39,46 +74,569 @@ bool resetSI4703Hardware();
 void i2cBusRecover();
 bool syncRTCWithNTP();
 bool syncRTCWithNTPRetries();
+void maintainWiFiConnection();
 void setTDA7439Balance(int8_t bal);
 void initRpiSerial();
 void pollRpiSerial();
-void sendRpiCommand(const char *cmd);
-void processRpiLine(const String &line);
+bool sendRpiCommand(const char *cmd);
+void processRpiLine(const char *line);
+static void setRpiUartEnabled(bool enabled);
 void updateRpiTitleTicker(bool forceRedraw);
-void drawRpiBargraph(bool forceRedraw);
 void updateRpiTransportPlayIcon(bool forceRedraw);
 void updateRpiPlayIndicator(bool forceRedraw);
-String shortenText(const String &s, size_t maxLen);
-
-String shortenText(const String &s, size_t maxLen) {
-  if (s.length() <= maxLen) return s;
-  if (maxLen <= 3) return s.substring(0, maxLen);
-  return s.substring(0, maxLen - 3) + "...";
-}
+bool sendPcCommand(const char *cmd);
+void pollPcBridge();
+void processPcStatLine(const char *line);
+void updatePcNowPlayingUi(bool forceRedraw);
+void setPcAnalogUi(bool enabled, bool persistPrefs = true);
+void handlePc();
+extern bool standbyState;
+extern bool rpiBridgeArmed;
 
 // Standby control pins
-#define POWER_INDICATOR_PIN 33  // OUTPUT: HIGH when ESP32 is powered
+#define POWER_INDICATOR_PIN 33  // OUTPUT: HIGH la boot — nu se mai comută la standby (fără relay pe GPIO33)
 #define STANDBY_CTRL_PIN 32     // GPIO button to toggle standby
-#define STANDBY_OUT_PIN 33      // Standby state output
 #define RADIO_LED_PIN 17        // OUTPUT: HIGH = FM radio active, LOW = radio off
 #define STANDBY_DEBOUNCE_MS 50  // Debounce interval (ms)
-#define RPI_SERIAL_RX_PIN 34    // ESP32 RX <- Raspberry TX
+#define RPI_SERIAL_RX_PIN 25    // ESP32 RX <- Raspberry TX
 #define RPI_SERIAL_TX_PIN 27    // ESP32 TX -> Raspberry RX
 #define RPI_SERIAL_BAUD 115200
 // Touch compensation for RPI control row (positive=to right, negative=to left)
 #define RPI_TOUCH_X_OFFSET -72
+
+// Windows / foobar2000 bridge (LAN).
+// Expected to be a small HTTP server running on the PC.
+static const char *PC_BRIDGE_HOST = "192.168.7.77"; // set to your PC IP
+static const uint16_t PC_BRIDGE_PORT = 8765;
+// Too small timeouts can cause intermittent -11 (connect fail) during brief WiFi/PC stalls.
+static const uint16_t PC_BRIDGE_TIMEOUT_MS = 800;
+
+// PC audio routing:
+// - PCA: PC audio via XMOS/USB path (current setup: keep TDA input same as Raspberry)
+// - PCD: PC audio "analog" path (legacy PC input on TDA7439)
+//
+// If you wire a hardware mux/relay, set PC_AUDIO_SEL_PIN to the GPIO that selects XMOS vs analog.
+// - PCA (XMOS) => LOW, PCD (analog) => HIGH (invert with PC_AUDIO_SEL_ACTIVE_HIGH if needed)
+static const int PC_AUDIO_SEL_PIN = -1;  // set to a valid GPIO when hardware is wired
+static const bool PC_AUDIO_SEL_ACTIVE_HIGH = true;
+
+// Optional I2S selector output (for external DAC boards like Audiophonics ES9038):
+// - PCD (source id=5) is the "PC digital" mode (foobar UI) but still uses the RPi transport path in the UI.
+// - Hardware often needs a GPIO to switch I2S input between Amanero (PC) and Raspberry (RPi).
+//
+// Configure this pin to drive your I2S mux/relay:
+// - Set to 13 or 14 (or any free GPIO) to enable; set to -1 to disable.
+// - Polarity is board-dependent. Configure which level selects Amanero:
+//    - true  => Amanero selected with HIGH, Raspberry with LOW
+//    - false => Amanero selected with LOW,  Raspberry with HIGH (common)
+static const int PC_DIGITAL_STATUS_PIN = 14;
+static const bool PC_DIGITAL_STATUS_AMANERO_LEVEL_HIGH = true;
+
+// Persisted preferences keys (stored in NVS via FMRadioController::saveSettingsNow)
+static bool pcAnalogUi = false;      // true => show big "PC ANALOG" overlay (hides metadata)
+
+static void fmtShorten(const char *s, size_t maxLen, char *out, size_t outCap) {
+  if (!out || outCap == 0) return;
+  if (!s) s = "";
+  size_t len = strlen(s);
+  if (len < maxLen) maxLen = len;
+  if (maxLen >= outCap) maxLen = outCap - 1;
+  if (len <= maxLen) {
+    memcpy(out, s, maxLen);
+    out[maxLen] = '\0';
+    return;
+  }
+  if (maxLen <= 3) {
+    memcpy(out, s, maxLen);
+    out[maxLen] = '\0';
+    return;
+  }
+  size_t keep = maxLen - 3;
+  memcpy(out, s, keep);
+  memcpy(out + keep, "...", 4); // includes NUL
+}
+
+static bool streqLower(const char *a, const char *b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    char ca = *a++;
+    char cb = *b++;
+    if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+    if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+    if (ca != cb) return false;
+  }
+  return *a == *b;
+}
+
+static bool rpiPlayingFromState(const char *state) {
+  return streqLower(state, "play") || streqLower(state, "playing");
+}
+
+static void appendJsonEscaped(String &json, const char *raw) {
+  if (!raw) raw = "";
+  json += '"';
+  for (const char *p = raw; *p; p++) {
+    char c = *p;
+    if (c == '\\' || c == '"') {
+      json += '\\';
+      json += c;
+    } else {
+      json += c;
+    }
+  }
+  json += '"';
+}
+
+static void printJsonEscaped(Print &out, const char *raw) {
+  if (!raw) raw = "";
+  out.print('"');
+  for (const char *p = raw; *p; p++) {
+    char c = *p;
+    if (c == '\\' || c == '"') {
+      out.print('\\');
+      out.print(c);
+    } else if (c == '\n') {
+      out.print("\\n");
+    } else if (c == '\r') {
+      out.print("\\r");
+    } else if (c == '\t') {
+      out.print("\\t");
+    } else {
+      out.print(c);
+    }
+  }
+  out.print('"');
+}
+
+static void sendJsonEscapedContent(WebServer &srv, const char *raw) {
+  if (!raw) raw = "";
+  // Batch into RAM buffer — per-character sendContent() was hundreds of TCP segments per /status.
+  uint8_t buf[192];
+  size_t pos = 0;
+  auto flush = [&]() {
+    if (pos) {
+      srv.sendContent((const char *)buf, pos);
+      pos = 0;
+    }
+  };
+  auto room = [&](size_t need) {
+    if (pos + need > sizeof(buf)) flush();
+  };
+
+  room(1);
+  buf[pos++] = (uint8_t)'"';
+  for (const char *p = raw; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c == '\\' || c == '"') {
+      room(2);
+      buf[pos++] = (uint8_t)'\\';
+      buf[pos++] = c;
+    } else if (c == '\n') {
+      room(2);
+      buf[pos++] = (uint8_t)'\\';
+      buf[pos++] = (uint8_t)'n';
+    } else if (c == '\r') {
+      room(2);
+      buf[pos++] = (uint8_t)'\\';
+      buf[pos++] = (uint8_t)'r';
+    } else if (c == '\t') {
+      room(2);
+      buf[pos++] = (uint8_t)'\\';
+      buf[pos++] = (uint8_t)'t';
+    } else {
+      room(1);
+      buf[pos++] = c;
+    }
+  }
+  room(1);
+  buf[pos++] = (uint8_t)'"';
+  flush();
+}
+
+// Buffer repeated sendContent() calls to avoid many tiny TCP segments (big impact on WebUI "Content Download" time).
+// Designed for chunked responses (CONTENT_LENGTH_UNKNOWN) where we already use sendContent() streaming.
+class WebChunkedWriter {
+public:
+  explicit WebChunkedWriter(WebServer &srv) : srv_(srv) {}
+
+  inline void write(const char *s) {
+    if (!s) return;
+    while (*s) writeChar(*s++);
+  }
+
+  inline void writeChar(char c) {
+    if (pos_ >= sizeof(buf_)) flush();
+    buf_[pos_++] = (uint8_t)c;
+  }
+
+  inline void writeInt(long v) {
+    char tmp[24];
+    snprintf(tmp, sizeof(tmp), "%ld", v);
+    write(tmp);
+  }
+
+  inline void writeFloat2(double v) {
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "%.2f", v);
+    write(tmp);
+  }
+
+  inline void writeJsonEscaped(const char *raw) {
+    if (!raw) raw = "";
+    writeChar('"');
+    for (const char *p = raw; *p; p++) {
+      unsigned char c = (unsigned char)*p;
+      if (c == '\\' || c == '"') {
+        writeChar('\\');
+        writeChar((char)c);
+      } else if (c == '\n') {
+        writeChar('\\');
+        writeChar('n');
+      } else if (c == '\r') {
+        writeChar('\\');
+        writeChar('r');
+      } else if (c == '\t') {
+        writeChar('\\');
+        writeChar('t');
+      } else {
+        writeChar((char)c);
+      }
+    }
+    writeChar('"');
+  }
+
+  inline void flush() {
+    if (!pos_) return;
+    srv_.sendContent((const char *)buf_, pos_);
+    pos_ = 0;
+  }
+
+private:
+  WebServer &srv_;
+  uint8_t buf_[1536];
+  size_t pos_ = 0;
+};
+
+static void sendContentInt(WebServer &srv, long v) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%ld", v);
+  srv.sendContent(buf);
+}
+
+static void sendContentFloat2(WebServer &srv, double v) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.2f", v);
+  srv.sendContent(buf);
+}
+
+// Defined later (after globals like fmRadio / rpi buffers exist).
+static void sendStatusJson(WebServer &srv);
+static void sendStateV2Json(WebServer &srv);
+
+// ESP32 lwIP: one client + keep-alive often leaves sockets wedged; close after each response for reliability.
+static void webHeadersNoCacheClose(WebServer &srv) {
+  srv.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  srv.sendHeader("Pragma", "no-cache");
+  srv.sendHeader("Connection", "close");
+}
+
+static void webBeginJsonStream(WebServer &srv) {
+  webHeadersNoCacheClose(srv);
+  srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  srv.send(200, "application/json", "");
+}
+
+static void webSendProgmemChunked(WebServer &srv, const char *contentType, const char *progmem) {
+  if (!progmem) {
+    webSendText(srv, 500, "missing content");
+    return;
+  }
+  webHeadersNoCacheClose(srv);
+  srv.sendHeader("Expires", "0");
+  srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  srv.send(200, contentType ? contentType : "text/plain", "");
+
+  const size_t total = strlen_P(progmem);
+  const size_t CHUNK = 1024;
+  for (size_t off = 0; off < total; off += CHUNK) {
+    size_t n = total - off;
+    if (n > CHUNK) n = CHUNK;
+    srv.sendContent_P(progmem + off, n);
+    yield();
+  }
+  webEndStream(srv);
+}
+
+// When using CONTENT_LENGTH_UNKNOWN (chunked), we must terminate the response body.
+static inline void webEndStream(WebServer &srv) {
+  srv.sendContent("");
+}
+
+// Tiny JSON for /rpi and /pc — full sendStatusJson() here was heavy and stacked with Moode STAT traffic.
+static void webSendJsonOk(WebServer &srv) {
+  webBeginJsonStream(srv);
+  srv.sendContent("{\"ok\":true}");
+  webEndStream(srv);
+}
+
+static inline void webSendStateV2(WebServer &srv) {
+  webBeginJsonStream(srv);
+  sendStateV2Json(srv);
+  webEndStream(srv);
+}
+
+static inline void webSendText(WebServer &srv, int code, const char *msg) {
+  webHeadersNoCacheClose(srv);
+  srv.send(code, "text/plain", msg ? msg : "");
+}
+
+static inline void webSendBadRequest(WebServer &srv, const char *msg) {
+  webSendText(srv, 400, msg);
+}
+
+static inline void webSendConflict(WebServer &srv, const char *msg) {
+  webSendText(srv, 409, msg);
+}
+
+static volatile bool webStatusBusy = false;
+static volatile bool webSystemInfoBusy = false;
+static volatile bool webPresetsBusy = false;
+
+static bool webRejectIfStandby(WebServer &srv) {
+  if (!standbyState) return false;
+  webSendText(srv, 403, "Device is in standby");
+  return true;
+}
+
+#if defined(ARDUINO_ARCH_ESP32)
+static bool popPendingCommand(volatile bool &pendingFlag, char *sharedBuf, size_t sharedCap, char *outBuf, size_t outCap, portMUX_TYPE *mux) {
+  bool have = false;
+  portENTER_CRITICAL(mux);
+  if (pendingFlag) {
+    size_t n = (sharedCap < outCap) ? sharedCap : outCap;
+    memcpy(outBuf, (const void *)sharedBuf, n);
+    outBuf[outCap - 1] = '\0';
+    pendingFlag = false;
+    have = true;
+  }
+  portEXIT_CRITICAL(mux);
+  return have;
+}
+
+static void setPendingCommand(volatile bool &pendingFlag, char *sharedBuf, size_t sharedCap, const char *cmd, portMUX_TYPE *mux) {
+  portENTER_CRITICAL(mux);
+  strncpy(sharedBuf, cmd ? cmd : "", sharedCap - 1);
+  sharedBuf[sharedCap - 1] = '\0';
+  pendingFlag = true;
+  portEXIT_CRITICAL(mux);
+}
+#else
+static bool popPendingCommand(volatile bool &pendingFlag, char *sharedBuf, size_t sharedCap, char *outBuf, size_t outCap) {
+  if (!pendingFlag) return false;
+  size_t n = (sharedCap < outCap) ? sharedCap : outCap;
+  memcpy(outBuf, (const void *)sharedBuf, n);
+  outBuf[outCap - 1] = '\0';
+  pendingFlag = false;
+  return true;
+}
+
+static void setPendingCommand(volatile bool &pendingFlag, char *sharedBuf, size_t sharedCap, const char *cmd) {
+  strncpy(sharedBuf, cmd ? cmd : "", sharedCap - 1);
+  sharedBuf[sharedCap - 1] = '\0';
+  pendingFlag = true;
+}
+#endif
 
 bool inStandby = false;  // track our current mode
 
 #if defined(ARDUINO_ARCH_ESP32)
 // Forward declaration for global web server instance
 extern WebServer server;
+// Globals defined later; used by background tasks.
+extern bool standbyState;
+extern volatile int lastPcHttpCode;
+extern volatile bool pcBridgeOk;
+// PC bridge diagnostics (defined later; updated by pcBridgeTask and reported via /api/v2/state)
+extern volatile uint32_t pcOkCount;
+extern volatile uint32_t pcFailCount;
+extern volatile uint32_t pcConnectFailCount;
+extern volatile uint32_t pcReadFailCount;
+extern volatile uint32_t pcLastOkMs;
+extern volatile uint32_t pcLastFailMs;
+extern volatile int pcLastFailCode;
+extern volatile uint32_t pcLastDtMs;
+
+// Web task diagnostics (helps debug "WebUI sluggish" without Serial spam)
+static volatile uint32_t webTaskLastUs = 0;
+static volatile uint32_t webTaskMaxUs = 0;
+static volatile uint32_t webTaskLoops = 0;
+static volatile uint32_t webTaskLastMs = 0;
+
 static TaskHandle_t webServerTaskHandle = nullptr;
 static void webServerTask(void *param) {
   for (;;) {
+    uint32_t t0 = micros();
     ArduinoOTA.handle();
     server.handleClient();
-    vTaskDelay(2);
+    uint32_t dt = micros() - t0;
+    webTaskLastUs = dt;
+    if (dt > webTaskMaxUs) webTaskMaxUs = dt;
+    webTaskLoops++;
+    webTaskLastMs = (uint32_t)millis();
+    vTaskDelay(1);
+  }
+}
+
+// PC bridge polling: keep blocking HTTP out of loop().
+static TaskHandle_t pcBridgeTaskHandle = nullptr;
+static portMUX_TYPE pcStatMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool pcStatPending = false;
+static char pcStatPendingLine[220];
+
+// Snapshot of UI state for background tasks (avoid referencing `fmRadio` here; it is defined later).
+static volatile int pcUiSource = 0;
+static volatile bool pcUiUtilMode = false;
+
+static void pcSetPendingStatLine(const char *line) {
+  if (!line) return;
+  portENTER_CRITICAL(&pcStatMux);
+  strncpy(pcStatPendingLine, line, sizeof(pcStatPendingLine) - 1);
+  pcStatPendingLine[sizeof(pcStatPendingLine) - 1] = '\0';
+  pcStatPending = true;
+  portEXIT_CRITICAL(&pcStatMux);
+}
+
+static bool pcPopPendingStatLine(char *out, size_t outCap) {
+  if (!out || outCap == 0) return false;
+  bool have = false;
+  portENTER_CRITICAL(&pcStatMux);
+  if (pcStatPending) {
+    strncpy(out, pcStatPendingLine, outCap - 1);
+    out[outCap - 1] = '\0';
+    pcStatPending = false;
+    have = true;
+  }
+  portEXIT_CRITICAL(&pcStatMux);
+  return have;
+}
+
+static int pcFetchStateLine(char *outLine, size_t outCap, uint32_t timeoutMs) {
+  if (!outLine || outCap == 0) return -1;
+  outLine[0] = '\0';
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  if (!PC_BRIDGE_HOST || !PC_BRIDGE_HOST[0]) return -1;
+
+  WiFiClient client;
+  client.setTimeout((timeoutMs + 50) / 1000.0f);
+
+  const uint32_t t0 = millis();
+  // Prefer numeric IP connect (avoids any hostname parsing/DNS edge cases on ESP32).
+  // Also retry connect until timeout to reduce "flapping" during short WiFi/PC stalls.
+  bool connected = false;
+  IPAddress ip;
+  const bool isIp = ip.fromString(PC_BRIDGE_HOST);
+  while ((millis() - t0) <= timeoutMs) {
+    if (isIp) connected = client.connect(ip, PC_BRIDGE_PORT);
+    else connected = client.connect(PC_BRIDGE_HOST, PC_BRIDGE_PORT);
+    if (connected) break;
+    delay(10);
+  }
+  if (!connected) {
+    return -11; // connect failure
+  }
+
+  client.print("GET /state HTTP/1.1\r\nHost: ");
+  client.print(PC_BRIDGE_HOST);
+  client.print("\r\nConnection: close\r\n\r\n");
+
+  // Read status line (best-effort) + headers until blank line.
+  int code = -1;
+  String status = client.readStringUntil('\n');
+  status.trim();
+  if (status.startsWith("HTTP/")) {
+    int sp = status.indexOf(' ');
+    if (sp > 0 && sp + 1 < status.length()) {
+      code = status.substring(sp + 1).toInt();
+    }
+  }
+  // Drain headers.
+  while (client.connected()) {
+    if ((millis() - t0) > timeoutMs) break;
+    String h = client.readStringUntil('\n');
+    if (h.length() <= 1) break; // "\r" or empty
+  }
+
+  // Body is a single STAT|... line.
+  String body = client.readStringUntil('\n');
+  body.trim();
+  if (body.length() == 0) return (code > 0) ? code : -12;
+  strncpy(outLine, body.c_str(), outCap - 1);
+  outLine[outCap - 1] = '\0';
+  return (code > 0) ? code : 200;
+}
+
+static void pcBridgeTask(void *param) {
+  (void)param;
+  uint8_t failStreak = 0;
+  uint32_t lastOkMs = 0;
+  for (;;) {
+    if (!ENABLE_PC_BRIDGE_POLLING) {
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      continue;
+    }
+    // Only poll when PCA/PCD is active and not in standby.
+    // NOTE: `utilMode` is a touchscreen-only mode; it shouldn't disable foobar polling,
+    // otherwise WebUI can get stuck showing Offline with transport disabled.
+    const int src = pcUiSource;
+    const bool active = (!standbyState) && (src == 4 || src == 5);
+    if (!active || WiFi.status() != WL_CONNECTED) {
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    const uint32_t now = millis();
+    const uint32_t timeoutMs = PC_BRIDGE_TIMEOUT_MS; // keep consistent with existing config
+    char line[220];
+    uint32_t t0 = millis();
+    int code = pcFetchStateLine(line, sizeof(line), timeoutMs);
+    uint32_t dt = millis() - t0;
+
+    lastPcHttpCode = code;
+    pcLastDtMs = (uint32_t)dt;
+    // HTTP OK means the bridge is reachable; body may be empty on a slow read.
+    if (code >= 200 && code < 300) {
+      pcBridgeOk = true;
+      failStreak = 0;
+      lastOkMs = (uint32_t)millis();
+      pcLastOkMs = lastOkMs;
+      pcOkCount++;
+      if (line[0]) pcSetPendingStatLine(line);
+      // Reduce socket churn (each poll opens a new TCP connection).
+      // 650ms was still aggressive on ESP32 + WebUI traffic; use ~1.5s with small jitter.
+      vTaskDelay((1500 + (esp_random() % 150)) / portTICK_PERIOD_MS);
+    } else {
+      // Avoid flapping the UI Offline on a single transient connect/read failure.
+      // Keep last known ONLINE for a short grace window after the last success.
+      const uint32_t nowMs = (uint32_t)millis();
+      const bool inGrace = (lastOkMs != 0) && ((uint32_t)(nowMs - lastOkMs) < 2500U);
+      if (!inGrace) pcBridgeOk = false;
+      if (failStreak < 20) failStreak++;
+      pcFailCount++;
+      pcLastFailMs = nowMs;
+      pcLastFailCode = code;
+      if (code == -11) pcConnectFailCount++;
+      else pcReadFailCount++;
+      // Recover quickly when the PC bridge comes back:
+      // - first few failures: retry fast (250ms)
+      // - after that: ramp to a modest max (5s), not 60s
+      uint32_t backoff = 250UL;
+      if (failStreak > 6) {
+        backoff = 250UL * (uint32_t)(failStreak - 5); // 250,500,750,...
+        if (backoff > 5000UL) backoff = 5000UL;
+      }
+      // Also add a tiny jitter while failing so retries don't phase-lock with WebUI refresh.
+      vTaskDelay((backoff + (esp_random() % 80)) / portTICK_PERIOD_MS);
+    }
   }
 }
 #endif
@@ -97,6 +655,12 @@ static void webServerTask(void *param) {
 #define TOUCH_MAX_X 3800
 #define TOUCH_MIN_Y 300
 #define TOUCH_MAX_Y 3700
+// Touch panel orientation.
+// Coordinate system expected by hitboxes: (0,0) = top-left.
+// User measurement: bottom-right reports (0,0) and top-left reports (320,240),
+// so we must mirror BOTH axes to get UI coordinates.
+#define TOUCH_MIRROR_X 1
+#define TOUCH_MIRROR_Y 1
 
 // MCP23017: INT A = GPIO36, INT B = GPIO39; SDA/SCL shared with I2C bus
 #define MCP_INT_A_PIN 36
@@ -136,6 +700,20 @@ static void webServerTask(void *param) {
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
 
+// Transport row (RPI/PC): draw rects MUST match touch — tx = mappedX + RPI_TOUCH_X_OFFSET.
+#define TRANSPORT_ROW_Y     149
+#define TRANSPORT_ROW_H     45
+#define TRANSPORT_BTN_W     70
+#define TRANSPORT_BTN_GAP   2
+#define TRANSPORT_BTN0_X    0
+#define TRANSPORT_BTN1_X    (TRANSPORT_BTN0_X + TRANSPORT_BTN_W + TRANSPORT_BTN_GAP)
+#define TRANSPORT_BTN2_X    (TRANSPORT_BTN1_X + TRANSPORT_BTN_W + TRANSPORT_BTN_GAP)
+/* PCA/PCD: aceeași linie ca transportul, aceeași lățime ca Prev/Play/Next, lipit de marginea
+   dreaptă a display-ului (orizontal în dreptul butonului TUN din rândul de sus). */
+#define TRANSPORT_TX_MAX0   71
+#define TRANSPORT_TX_MAX1   143
+#define TRANSPORT_TX_MAX2   214
+
 #define CUSTOM_GREY 0x7BEF
 #define CUSTOM_LIGHTGREY 0xC618
 #define CUSTOM_DARKGREEN 0x03E0
@@ -145,19 +723,26 @@ static void webServerTask(void *param) {
 #define DEBOUNCE_DELAY 50  // Debounce delay in milliseconds
 constexpr unsigned long AUTO_MODE_SWITCH_DELAY = 10000;
 
-#define SEEK_BUTTON_X_MIN 0
-#define SEEK_BUTTON_X_MAX 60
-#define SEEK_BUTTON_Y_MIN 40
-#define SEEK_BUTTON_Y_MAX 100
-#define SEEK_BUTTON_Z_MIN 80
-#define SEEK_BUTTON_Z_MAX 120
-#define SEEK_BUTTON_W_MIN 40
-#define SEEK_BUTTON_W_MAX 100
+// Seek buttons (triangles) are drawn in drawSeekButton() around y=160..190 on the right side.
+// Use bounding boxes that cover the triangles.
+#define SEEK_UP_X_MIN   270
+#define SEEK_UP_X_MAX   (SCREEN_WIDTH - 1)
+#define SEEK_UP_Y_MIN   155
+#define SEEK_UP_Y_MAX   195
+#define SEEK_DN_X_MIN   205
+#define SEEK_DN_X_MAX   265
+#define SEEK_DN_Y_MIN   155
+#define SEEK_DN_Y_MAX   195
 
 #define SETUP_BUTTON_X_MIN 260
 #define SETUP_BUTTON_Y_MIN 200
 #define SETUP_BUTTON_WIDTH 60
 #define SETUP_BUTTON_HEIGHT 40
+// UTIL EQ screen: must match FMRadioController::drawsetScreen() plus/minus rects.
+#define UTIL_EQ_PLUS_Y_MIN   88
+#define UTIL_EQ_PLUS_Y_MAX   127
+#define UTIL_EQ_MINUS_Y_MIN  156
+#define UTIL_EQ_MINUS_Y_MAX  195
 
 #define SI4703_ADDR 0x10  // Default I2C address for SI4703
 
@@ -239,23 +824,165 @@ static unsigned long lastRpiRxMs = 0;
 static bool rpiConnected = false;
 static char rpiRxLine[300];
 static uint16_t rpiRxLen = 0;
-static String rpiState = "unknown";
-static String rpiTitle = "-";
-static String rpiArtist = "-";
-static String rpiFile = "-";
+static char rpiStateBuf[16] = "unknown";
+static char rpiTitleBuf[96] = "-";
+static char rpiArtistBuf[96] = "-";
+static char rpiFileBuf[96] = "-";
 static unsigned long lastRpiCmdTxMs = 0;
-static String lastRpiCmdTx = "";
-static uint8_t rpiFftL[12] = {0};
-static uint8_t rpiFftR[12] = {0};
-static bool rpiFftDirty = false;
-static unsigned long lastRpiFftMs = 0;
-static unsigned long lastRpiBarDrawMs = 0;
+static char lastRpiCmdTxBuf[16] = "";
+static unsigned long rpiForceGetAtMs = 0;
 static unsigned long lastRpiBlinkMs = 0;
 static bool rpiBlinkOn = false;
+
+// PC (foobar) metadata via windows_foobar_bridge.py (/state -> STAT|... line)
+static char pcStateBuf[16] = "unknown";
+static char pcTitleBuf[96] = "-";
+static char pcArtistBuf[96] = "-";
+static char pcExtraBuf[96] = "-";
+volatile bool pcBridgeOk = false;
+static unsigned long lastPcPollMs = 0;
+static unsigned long pcForcePollAtMs1 = 0;
+static unsigned long pcForcePollAtMs2 = 0;
+static unsigned long lastPcRxMs = 0;
+volatile int lastPcHttpCode = 0;
+// PC bridge diagnostics (helps root-cause intermittent -11/-12 without Serial spam)
+volatile uint32_t pcOkCount = 0;
+volatile uint32_t pcFailCount = 0;
+volatile uint32_t pcConnectFailCount = 0; // -11
+volatile uint32_t pcReadFailCount = 0;    // -12 or other non-2xx without body
+volatile uint32_t pcLastOkMs = 0;
+volatile uint32_t pcLastFailMs = 0;
+volatile int pcLastFailCode = 0;
+volatile uint32_t pcLastDtMs = 0;
+
+// WiFi.RSSI() can block the web server task; refresh from main loop (~1 Hz).
+static volatile int webStatusWifiRssi = -127;
+static unsigned long webStatusWifiRssiAtMs = 0;
+
+// Web UI -> PC bridge transport: run HTTPClient in loop(), never in the web server task
+// (blocking WiFi client freezes /, /status, and causes partial page loads).
+static const size_t WEB_CMD_BUF_CAP = 16;
+volatile bool pcWebCmdPending = false;
+static char pcWebCmdBuf[WEB_CMD_BUF_CAP];
+#if defined(ARDUINO_ARCH_ESP32)
+static portMUX_TYPE pcWebCmdMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
+// Web UI -> UART: never call Serial2 from the HTTP task (TX can block; RPi off => Web UI freeze).
+volatile bool rpiWebCmdPending = false;
+static char rpiWebCmdBuf[WEB_CMD_BUF_CAP];
+#if defined(ARDUINO_ARCH_ESP32)
+static portMUX_TYPE rpiWebCmdMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+// After failed UART TX, wait before retry (avoid tight spin on full TX buffer).
+static unsigned long rpiWebCmdNextTryMs = 0;
+
+// PCD mode: uses source 3 (RPi input) but shows/controls foobar via PC bridge.
+static bool pcdMode = false;
+
+// #region agent log: periodic UI freeze profiler (ESP32 Serial)
+static uint32_t profDrawUsMax = 0;
+static uint32_t profMainContentUsMax = 0;
+static uint32_t profLoopUsMax = 0;
+static uint32_t profPollUsMax = 0;
+static uint32_t profFmUpdateUsMax = 0;
+static uint32_t profTouchUsMax = 0;
+static uint32_t profShowTimeUsMax = 0;
+static uint32_t profStatMiniUsMax = 0;
+static uint32_t profStatUsMax = 0;
+static uint32_t profTickerUsMax = 0;
+static uint16_t profTickerDraws = 0;
+static uint32_t profHeapMin = 0xFFFFFFFFu;
+static uint32_t profHeapNow = 0;
+static uint32_t profPrintUsMax = 0;
+static uint32_t profApplyTdaUsMax = 0;
+static uint16_t profProfSkipped = 0;
+static uint16_t profProfSent = 0;
+static uint16_t profSysInfoRuns = 0;
+static uint16_t profNvsWrites = 0;
+static uint32_t profStatCount = 0;
+static unsigned long profWindowStartMs = 0;
+// #endregion
 
 // Short-deferred TDA apply to avoid blocking HTTP handlers
 static bool audioApplyPending = false;
 static unsigned long audioApplyAt = 0;
+
+// --- Audio debug snapshot (visible in /api/v2/state) ---
+static volatile unsigned long lastTdaWriteMs = 0;
+static volatile int lastTdaInput = -1;
+static volatile int lastTdaVolume = -1;
+static char lastTdaWhy[16] = "boot";
+
+// Boot-time TDA volume reporter: prints every 10s for 5 minutes after boot.
+#ifndef BOOT_TDA_VOLUME_LOG
+#define BOOT_TDA_VOLUME_LOG 0
+#endif
+static bool bootTdaLogActive = false;
+static unsigned long bootTdaLogUntilMs = 0;
+static unsigned long bootTdaLogNextMs = 0;
+
+static inline void log_tda_event(const char *why, int input, int vol) {
+#if !DEBUG_SERIAL_LOGS
+  (void)why; (void)input; (void)vol;
+  return;
+#else
+  // Throttle to avoid making performance worse.
+  static unsigned long lastLogMs = 0;
+  unsigned long now = millis();
+  if (now - lastLogMs < 750UL) return;
+  lastLogMs = now;
+
+  Serial.print("[AUDIO] t=");
+  Serial.print(now);
+  Serial.print(" why=");
+  Serial.print(why ? why : "?");
+  if (input >= 0) { Serial.print(" in="); Serial.print(input); }
+  if (vol >= 0) { Serial.print(" vol="); Serial.print(vol); }
+  Serial.println();
+#endif
+}
+
+static inline void noteTdaWrite(const char *why, int input, int vol) {
+  lastTdaWriteMs = millis();
+  if (input >= 0) lastTdaInput = input;
+  if (vol >= 0) lastTdaVolume = vol;
+  if (why && why[0]) {
+    strncpy(lastTdaWhy, why, sizeof(lastTdaWhy) - 1);
+    lastTdaWhy[sizeof(lastTdaWhy) - 1] = '\0';
+  }
+  log_tda_event(why, input, vol);
+}
+
+static inline void tickBootTdaVolumeLog(int uiVol, bool muted) {
+#if !BOOT_TDA_VOLUME_LOG
+  (void)uiVol;
+  (void)muted;
+  return;
+#else
+  if (!bootTdaLogActive) return;
+  const unsigned long now = millis();
+  if ((long)(now - bootTdaLogUntilMs) >= 0) {
+    bootTdaLogActive = false;
+    return;
+  }
+  if ((long)(now - bootTdaLogNextMs) < 0) return;
+  bootTdaLogNextMs = now + 10000UL;
+  if (Serial.availableForWrite() < 64) return;
+  Serial.print("[BOOT][TDA] t=");
+  Serial.print(now);
+  Serial.print(" uiVol=");
+  Serial.print(uiVol);
+  Serial.print(" muted=");
+  Serial.print(muted ? 1 : 0);
+  Serial.print(" lastTdaVol=");
+  Serial.print(lastTdaVolume);
+  Serial.print(" lastWriteMs=");
+  Serial.print(lastTdaWriteMs);
+  Serial.print(" why=");
+  Serial.println(lastTdaWhy);
+#endif
+}
 
 bool buttonPressed(uint8_t pin, bool &lastState, unsigned long &lastPressTime) {
   bool currentState = digitalRead(pin);
@@ -274,6 +1001,7 @@ bool buttonPressed(uint8_t pin, bool &lastState, unsigned long &lastPressTime) {
 static uint8_t cachedPortA = 0xFF, cachedPortB = 0xFF;
 static uint32_t mainLoopCounter = 0;
 static uint32_t mcpLastReadLoopCounter = 0;
+static int lastSourceSeen = -1;
 
 bool buttonPressedMcp(uint8_t mcpPin, bool &lastState, unsigned long &lastPressTime) {
   bool currentState;
@@ -323,7 +1051,9 @@ void readMcp(bool forceRead = false) {
 // Default preset freqs (6 memorii radio MEM1..MEM6: PA7,PA6,PA0..PA3); no voltage/channel selection
 static const float defaultPresetFreqs[6] = { 93.5f, 96.9f, 100.2f, 105.3f, 92.8f, 96.1f };
 
-const char *sourceNames[] = { "", "TUN", "Bluetooth", "Raspberry PI", "PC" };
+// Source id mapping:
+// 1=TUN, 2=BT, 3=RPI, 4=PCA, 5=PCD
+const char *sourceNames[] = { "", "TUN", "Bluetooth", "Raspberry PI", "PCA", "PCD" };
 
 int Bass = 0;
 int Middle = 0;
@@ -425,17 +1155,18 @@ public:
     if (!eqEditMode) {
       eqEditMode = true;
       eqIndex = 0;
-      Serial.println("EQ mode activated: Bass");
+      // Serial.println("EQ mode activated: Bass");
     } else {
       eqIndex = (eqIndex + 1) % 4;
-      if (eqIndex == 0)
-        Serial.println("Switched to Bass");
-      else if (eqIndex == 1)
-        Serial.println("Switched to Mids");
-      else if (eqIndex == 2)
-        Serial.println("Switched to Treble");
-      else if (eqIndex == 3)
-        Serial.println("Switched to Gain");
+      if (eqIndex == 0) {
+        // Serial.println("Switched to Bass");
+      } else if (eqIndex == 1) {
+        // Serial.println("Switched to Mids");
+      } else if (eqIndex == 2) {
+        // Serial.println("Switched to Treble");
+      } else if (eqIndex == 3) {
+        // Serial.println("Switched to Gain");
+      }
     }
     // Redraw the full EQ setup screen when cycling parameters.
     drawsetScreen();
@@ -588,21 +1319,22 @@ public:
 
   void drawInitialScreen() {
     tft.setTextWrap(false);
-    tft.fillRect(0, 0, 80, 60, CUSTOM_DARKGREEN);
-    tft.fillRect(80, 0, 80, 60, CUSTOM_GREY);
-    tft.fillRect(160, 0, 80, 60, ST77XX_BLUE);
-    tft.fillRect(240, 0, 80, 60, ST77XX_ORANGE);
-    tft.fillRect(0, 50, 80, 10, ST77XX_RED);
+    // Top source bar: 5 buttons across 320px => 64px each
+    const int w = 64;
+    tft.fillRect(0 * w, 0, w, 60, CUSTOM_DARKGREEN); // PCA
+    tft.fillRect(1 * w, 0, w, 60, ST77XX_RED);      // PCD
+    tft.fillRect(2 * w, 0, w, 60, CUSTOM_GREY);     // RPI
+    tft.fillRect(3 * w, 0, w, 60, ST77XX_BLUE);     // BT
+    tft.fillRect(4 * w, 0, w, 60, ST77XX_ORANGE);   // TUN
+    // Underline band
+    tft.fillRect(0, 50, 320, 15, ST77XX_BLACK);
     tft.setTextColor(ST77XX_WHITE);
     tft.setTextSize(2);
-    tft.setCursor(24, 20);
-    tft.print("PC");
-    tft.setCursor(104, 20);
-    tft.print("RPI");
-    tft.setCursor(186, 20);
-    tft.print("BT");
-    tft.setCursor(262, 20);
-    tft.print("TUN");
+    tft.setCursor(6, 20);   tft.print("PCA");
+    tft.setCursor(70, 20);  tft.print("PCD");
+    tft.setCursor(138, 20); tft.print("RPI");
+    tft.setCursor(214, 20); tft.print("BT");
+    tft.setCursor(270, 20); tft.print("TUN");
     drawSetupButton();
     updateMainContent();
     updateVolumeDisplay();
@@ -706,23 +1438,22 @@ public:
         IPAddress ip = WiFi.localIP();
         char ipStr[20];
         sprintf(ipStr, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-        Serial.print("Device IP address: ");
-        Serial.println(ipStr);
+        // Serial.print("Device IP address: ");
+        // Serial.println(ipStr);
     }
   }
 
   void updateSelectedSourceDisplay() {
-    static const uint16_t zoneColors[4][4] = {
-      { CUSTOM_DARKGREEN, CUSTOM_GREY, ST77XX_BLUE, ST77XX_RED },
-      { CUSTOM_DARKGREEN, CUSTOM_GREY, ST77XX_RED, ST77XX_ORANGE },
-      { CUSTOM_DARKGREEN, ST77XX_RED, ST77XX_BLUE, ST77XX_ORANGE },
-      { ST77XX_RED, CUSTOM_GREY, ST77XX_BLUE, ST77XX_ORANGE }
-    };
-    int src = sursa - 1;
-    if (src < 0 || src > 3) return;
-    for (int i = 0; i < 4; i++) {
-      tft.fillRect(i * 80, 50, 80, 15, zoneColors[src][i]);
-    }
+    // Red underline under selected source in the 5-button top bar.
+    const int w = 64;
+    tft.fillRect(0, 50, 320, 15, ST77XX_BLACK);
+    int idx = 0;
+    if (sursa == 4) idx = 0;       // PCA
+    else if (sursa == 5) idx = 1;  // PCD
+    else if (sursa == 3) idx = 2;  // RPI
+    else if (sursa == 2) idx = 3;  // BT
+    else if (sursa == 1) idx = 4;  // TUN
+    tft.fillRect(idx * w, 50, w, 15, ST77XX_RED);
   }
 
   void updateMainContent() {
@@ -748,14 +1479,11 @@ public:
         rtUpdated = false;
       }
     } else if (sursa == 3) {
-      const int rpiLeftAreaW = 214;  // keep right 1/3 free for future bargraph
       tft.fillRect(0, 60, 320, 140, ST77XX_BLACK);
-      tft.fillRect(0, 110, rpiLeftAreaW, 90, ST77XX_BLACK);
-      tft.fillRect(rpiLeftAreaW, 60, 320 - rpiLeftAreaW, 140, ST77XX_BLACK);
-      // Keep RPI buttons in their original bottom row, +50% taller.
-      tft.fillRect(0, 149, 70, 45, CUSTOM_DARKGREEN);
-      tft.fillRect(72, 149, 70, 45, ST77XX_ORANGE);
-      tft.fillRect(144, 149, 70, 45, CUSTOM_DARKGREEN);
+      // Transport row: 3×70px + reserved slot (touch uses tx<=71/143/214 + offset for first three).
+      tft.fillRect(TRANSPORT_BTN0_X, TRANSPORT_ROW_Y, TRANSPORT_BTN_W, TRANSPORT_ROW_H, CUSTOM_DARKGREEN);
+      tft.fillRect(TRANSPORT_BTN1_X, TRANSPORT_ROW_Y, TRANSPORT_BTN_W, TRANSPORT_ROW_H, ST77XX_ORANGE);
+      tft.fillRect(TRANSPORT_BTN2_X, TRANSPORT_ROW_Y, TRANSPORT_BTN_W, TRANSPORT_ROW_H, CUSTOM_DARKGREEN);
       tft.setTextColor(ST77XX_WHITE);
       // PREV: two filled left-pointing triangles
       tft.fillTriangle(20, 171, 34, 161, 34, 181, ST77XX_WHITE);
@@ -764,33 +1492,70 @@ public:
       // NEXT: two filled right-pointing triangles
       tft.fillTriangle(166, 161, 166, 181, 180, 171, ST77XX_WHITE);
       tft.fillTriangle(184, 161, 184, 181, 198, 171, ST77XX_WHITE);
+      {
+        // RPI source: show RPi metadata
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_CYAN);
+        tft.fillRect(0, 77, SCREEN_WIDTH, 10, ST77XX_BLACK);
+        tft.setCursor(0, 77);
+        tft.print("RPI:");
+        tft.print(rpiConnected ? " ONLINE " : " OFFLINE ");
+        tft.print(" ");
+        tft.print(rpiStateBuf);
+        // File/format line uses full width (below the status row).
+        tft.fillRect(0, 88, SCREEN_WIDTH, 10, ST77XX_BLACK);
+        tft.setTextColor(ST77XX_WHITE);
+        tft.setTextSize(1);
+        tft.setCursor(0, 90);
+        {
+          char fileDisp[40];
+          fmtShorten(rpiFileBuf, 36, fileDisp, sizeof(fileDisp));
+          tft.print(fileDisp);
+        }
+        tft.setTextColor(ST77XX_CYAN);
 
-      tft.setTextSize(1);
-      tft.setTextColor(ST77XX_CYAN);
-      tft.setCursor(5, 77);
-      tft.print("RPI:");
-      tft.print(rpiConnected ? " ONLINE " : " OFFLINE ");
-      tft.print(" ");
-      tft.print(rpiState);
-      // Right side of status row: compact stream format info from bridge (e.g. "44.1k 16b AAC")
-      tft.fillRect(147, 74, 88, 10, ST77XX_BLACK);
+        updateRpiTitleTicker(true);
+        tft.fillRect(0, 123, SCREEN_WIDTH, 20, ST77XX_BLACK);
+        tft.setTextSize(2);
+        tft.setTextColor(ST77XX_WHITE);
+        tft.setCursor(0, 125);
+        {
+          char artistDisp[40];
+          fmtShorten(rpiArtistBuf, 30, artistDisp, sizeof(artistDisp));
+          tft.print(artistDisp);
+        }
+      }
+    } else if (sursa == 4) {
+      // PCA: analog input (IN1) - show "PC analogic" overlay.
+      tft.fillRect(0, 60, 320, 140, ST77XX_BLACK);
+      // No transport buttons on PCA.
+      tft.setTextSize(3);
       tft.setTextColor(ST77XX_WHITE);
-      tft.setCursor(147, 77);
-      tft.print(shortenText(rpiFile, 14));
-      tft.setTextColor(ST77XX_CYAN);
-
-      auto shorten = [](const String &s, size_t maxLen) -> String {
-        if (s.length() <= maxLen) return s;
-        return s.substring(0, maxLen - 3) + "...";
-      };
-
-      updateRpiTitleTicker(true);
-      tft.fillRect(5, 123, 206, 20, ST77XX_BLACK);
-      tft.setTextSize(2);
+      const char *msg = "PC analogic";
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(msg, 0, 0, &x1, &y1, &w, &h);
+      const int cx = (SCREEN_WIDTH - (int)w) / 2;
+      const int cy = 60 + (140 - (int)h) / 2;
+      tft.setCursor(cx, cy);
+      tft.print(msg);
+      pcAnalogUi = true;
+    } else if (sursa == 5) {
+      // PCD: foobar metadata/controls.
+      pcAnalogUi = false;
+      tft.fillRect(0, 60, 320, 140, ST77XX_BLACK);
+      tft.fillRect(TRANSPORT_BTN0_X, TRANSPORT_ROW_Y, TRANSPORT_BTN_W, TRANSPORT_ROW_H, CUSTOM_DARKGREEN);
+      tft.fillRect(TRANSPORT_BTN1_X, TRANSPORT_ROW_Y, TRANSPORT_BTN_W, TRANSPORT_ROW_H, ST77XX_ORANGE);
+      tft.fillRect(TRANSPORT_BTN2_X, TRANSPORT_ROW_Y, TRANSPORT_BTN_W, TRANSPORT_ROW_H, CUSTOM_DARKGREEN);
       tft.setTextColor(ST77XX_WHITE);
-      tft.setCursor(5, 125);
-      tft.print(shorten(rpiArtist, 18));
-      drawRpiBargraph(true);
+      // PREV
+      tft.fillTriangle(20, 171, 34, 161, 34, 181, ST77XX_WHITE);
+      tft.fillTriangle(38, 171, 52, 161, 52, 181, ST77XX_WHITE);
+      updateRpiTransportPlayIcon(true);
+      // NEXT
+      tft.fillTriangle(166, 161, 166, 181, 180, 171, ST77XX_WHITE);
+      tft.fillTriangle(184, 161, 184, 181, 198, 171, ST77XX_WHITE);
+      updatePcNowPlayingUi(true);
     } else {
       tft.setTextColor(ST77XX_WHITE);
       tft.setTextSize(3);
@@ -939,6 +1704,7 @@ public:
             }
             updateCurrentEqValueDisplay();
             saveSettings();
+            flushSettingsIfDue(true);
             lastUtilActivity = millis();
         }
         return;
@@ -967,8 +1733,8 @@ public:
                     tda7439.setVolume(currentVolume);
                     delay(10);
                 } else {
-                    Serial.print("TDA7439 Error during encoder volume change: ");
-                    Serial.println(error);
+                    // Serial.print("TDA7439 Error during encoder volume change: ");
+                    // Serial.println(error);
                 }
                 
                 saveSettings();
@@ -1065,7 +1831,13 @@ public:
       unsigned long now = millis();
       if (now - lastSourceChangeMs < 500) return;
       lastSourceChangeMs = now;
+      // Physical source select never enters PCD; PCD is a WebUI-only virtual source (5).
+      pcdMode = false;
       sursa = newSource;
+      if (sursa == 3) {
+        // User explicitly selected RPI on the physical panel; arm the bridge.
+        rpiBridgeArmed = true;
+      }
       yield();
       Wire.beginTransmission(0x44);
       byte error = Wire.endTransmission();
@@ -1076,6 +1848,7 @@ public:
         tda7439.setSnd(Treble, 3);
         tda7439.inputGain((Gain + 45) / 3);
         setTDA7439InputForSource(sursa);
+        // No extra PC audio routing mux.
       }
       yield();
       updateVolumeDisplay();
@@ -1110,15 +1883,17 @@ public:
       // Apply mute/unmute to TDA7439
       if (isMuted) {
         tda7439.setVolume(0);
-        Serial.println("[TDA7439] Muted");
+        noteTdaWrite("mute", -1, 0);
+        // Serial.println("[TDA7439] Muted");
       } else {
         tda7439.setVolume(currentVolume);
-        Serial.print("[TDA7439] Unmuted, restoring volume: ");
-        Serial.println(currentVolume);
+        noteTdaWrite("mute", -1, currentVolume);
+        // Serial.print("[TDA7439] Unmuted, restoring volume: ");
+        // Serial.println(currentVolume);
       }
     } else {
-      Serial.print("[TDA7439] NACK Error during mute toggle! Error code: ");
-      Serial.println(error);
+      // Serial.print("[TDA7439] NACK Error during mute toggle! Error code: ");
+      // Serial.println(error);
     }
     
     if (isMuted) {
@@ -1157,12 +1932,12 @@ public:
 
   void seekUp() {
     if (sursa != 1) return;
-    Serial.println("[SEEK] Starting seek up");
+    // Serial.println("[SEEK] Starting seek up");
     // Preflight: if bus/device not OK, try reinit to avoid freezes
     if (!detectSI4703()) {
-      Serial.println("[SEEK] SI4703 not responding; attempting reinit...");
+      // Serial.println("[SEEK] SI4703 not responding; attempting reinit...");
       if (!reinitSI4703()) {
-        Serial.println("[SEEK] Reinit failed; aborting seek.");
+        // Serial.println("[SEEK] Reinit failed; aborting seek.");
         return;
       }
     }
@@ -1170,27 +1945,27 @@ public:
       radio.seekUp(true);
       delay(100); // Give radio time to seek
       currentFrequency = radio.getFrequency() / 100.0;
-      Serial.print("[SEEK] Found frequency: ");
-      Serial.println(currentFrequency);
+      // Serial.print("[SEEK] Found frequency: ");
+      // Serial.println(currentFrequency);
       oldFrequency = currentFrequency;
       clearRDSData();
       updateMainContent();
       saveSettings();
       lastWebFreqChange = millis();
     } else {
-      Serial.println("[SEEK] Radio not powered, cannot seek");
+      // Serial.println("[SEEK] Radio not powered, cannot seek");
     }
   }
 
 
   void seekDown() {
     if (sursa != 1) return;
-    Serial.println("[SEEK] Starting seek down");
+    // Serial.println("[SEEK] Starting seek down");
     // Preflight: if bus/device not OK, try reinit to avoid freezes
     if (!detectSI4703()) {
-      Serial.println("[SEEK] SI4703 not responding; attempting reinit...");
+      // Serial.println("[SEEK] SI4703 not responding; attempting reinit...");
       if (!reinitSI4703()) {
-        Serial.println("[SEEK] Reinit failed; aborting seek.");
+        // Serial.println("[SEEK] Reinit failed; aborting seek.");
         return;
       }
     }
@@ -1198,15 +1973,15 @@ public:
       radio.seekDown(true);
       delay(100); // Give radio time to seek
       currentFrequency = radio.getFrequency() / 100.0;
-      Serial.print("[SEEK] Found frequency: ");
-      Serial.println(currentFrequency);
+      // Serial.print("[SEEK] Found frequency: ");
+      // Serial.println(currentFrequency);
       oldFrequency = currentFrequency;
       clearRDSData();
       updateMainContent();
       saveSettings();
       lastWebFreqChange = millis();
     } else {
-      Serial.println("[SEEK] Radio not powered, cannot seek");
+      // Serial.println("[SEEK] Radio not powered, cannot seek");
     }
   }
 
@@ -1221,8 +1996,17 @@ public:
   }
 
   void mapTouch(int rawX, int rawY, int &mappedX, int &mappedY) {
-    mappedX = map(rawX, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH);
-    mappedY = map(rawY, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT);
+    // Keep mapped coordinates inside display bounds.
+    mappedX = map(rawX, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH - 1);
+    mappedY = map(rawY, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT - 1);
+    mappedX = constrain(mappedX, 0, SCREEN_WIDTH - 1);
+    mappedY = constrain(mappedY, 0, SCREEN_HEIGHT - 1);
+#if TOUCH_MIRROR_X
+    mappedX = (SCREEN_WIDTH - 1) - mappedX;
+#endif
+#if TOUCH_MIRROR_Y
+    mappedY = (SCREEN_HEIGHT - 1) - mappedY;
+#endif
   }
 
   void saveSettings() {
@@ -1245,16 +2029,24 @@ public:
   }
 
   void saveSettingsNow() {
+    // #region agent log: H3 count NVS writes
+    profNvsWrites++;
+    // #endregion
     preferences.begin("settings", false);
     preferences.putInt("sursa", sursa);
     preferences.putInt("freq", (int)(currentFrequency * 100));
+    // Per-source volume (include PCD virtual id=5); keep legacy "volume" for backward compat.
+    int sid = sursa;
+    preferences.putInt(("vol" + String(sid)).c_str(), currentVolume);
     preferences.putInt("volume", currentVolume);
+    // Legacy flag kept for backward compatibility.
+    preferences.putBool("pcdMode", (sursa == 5));
 
-    String keyBass = "bass" + String(sursa);
-    String keyMiddle = "mid" + String(sursa);
-    String keyTreble = "treble" + String(sursa);
-    String keyGain = "gain" + String(sursa);
-    String keyBalance = "bal" + String(sursa);
+    String keyBass = "bass" + String(sid);
+    String keyMiddle = "mid" + String(sid);
+    String keyTreble = "treble" + String(sid);
+    String keyGain = "gain" + String(sid);
+    String keyBalance = "bal" + String(sid);
     preferences.putInt(keyBass.c_str(), Bass);
     preferences.putInt(keyMiddle.c_str(), Middle);
     preferences.putInt(keyTreble.c_str(), Treble);
@@ -1271,16 +2063,25 @@ public:
     sursa = preferences.getInt("sursa", 2);
     int freqInt = preferences.getInt("freq", DEFAULT_FREQ);
     currentFrequency = freqInt / 100.0;
-    currentVolume = preferences.getInt("volume", DEFAULT_VOLUME);
+    // Migrate legacy pcdMode (old: sursa=3 + pcdMode=true) to real source id=5.
+    pcdMode = preferences.getBool("pcdMode", false);
+    if (sursa == 3 && pcdMode) {
+      sursa = 5;
+      pcdMode = false;
+    }
+    int sid = sursa;
+    currentVolume = preferences.getInt(("vol" + String(sid)).c_str(), preferences.getInt("volume", DEFAULT_VOLUME));
+    // Do not force "PC analogic" overlay on PCA; keep it off by default.
+    pcAnalogUi = false;
     for (int i = 0; i < 6; i++) {
       sensor1MemFreq[i] = preferences.getFloat(("p" + String(i) + "f").c_str(), defaultPresetFreqs[i]);
     }
 
-    String keyBass = "bass" + String(sursa);
-    String keyMiddle = "mid" + String(sursa);
-    String keyTreble = "treble" + String(sursa);
-    String keyGain = "gain" + String(sursa);
-    String keyBalance = "bal" + String(sursa);
+    String keyBass = "bass" + String(sid);
+    String keyMiddle = "mid" + String(sid);
+    String keyTreble = "treble" + String(sid);
+    String keyGain = "gain" + String(sid);
+    String keyBalance = "bal" + String(sid);
     Bass = preferences.getInt(keyBass.c_str(), 0);
     Middle = preferences.getInt(keyMiddle.c_str(), 0);
     Treble = preferences.getInt(keyTreble.c_str(), 0);
@@ -1292,11 +2093,12 @@ public:
 
   void loadEqualizer() {
     preferences.begin("settings", true);
-    String keyBass = "bass" + String(sursa);
-    String keyMiddle = "mid" + String(sursa);
-    String keyTreble = "treble" + String(sursa);
-    String keyGain = "gain" + String(sursa);
-    String keyBalance = "bal" + String(sursa);
+    int sid = (sursa == 3 && pcdMode) ? 5 : sursa;
+    String keyBass = "bass" + String(sid);
+    String keyMiddle = "mid" + String(sid);
+    String keyTreble = "treble" + String(sid);
+    String keyGain = "gain" + String(sid);
+    String keyBalance = "bal" + String(sid);
     Bass = preferences.getInt(keyBass.c_str(), 0);
     Middle = preferences.getInt(keyMiddle.c_str(), 0);
     Treble = preferences.getInt(keyTreble.c_str(), 0);
@@ -1377,100 +2179,214 @@ public:
 FMRadioController *FMRadioController::instance = nullptr;
 FMRadioController fmRadio;
 
+static void sendStatusJson(WebServer &srv) {
+  // Stream response body via sendContent to avoid heap fragmentation.
+  // NOTE: caller must have already set headers + sent the 200 with empty body.
+  int rssi = (!standbyState && si4703Powered && fmRadio.sursa == 1) ? (int)lastFmRssi : -1;
+  int wifi = webStatusWifiRssi;
+  const int sid = fmRadio.sursa;
+
+  WebChunkedWriter w(srv);
+  w.write("{");
+  w.write("\"power\":\""); w.write(standbyState ? "off" : "on"); w.write("\",");
+  w.write("\"mute\":\""); w.write(fmRadio.isMuted ? "on" : "off"); w.write("\",");
+  w.write("\"volume\":"); w.writeInt((long)fmRadio.currentVolume); w.write(",");
+  w.write("\"source\":"); w.writeInt((long)sid); w.write(",");
+  w.write("\"freq\":"); w.writeFloat2((double)fmRadio.currentFrequency); w.write(",");
+  w.write("\"rssi\":"); w.writeInt((long)rssi); w.write(",");
+  w.write("\"wifi\":"); w.writeInt((long)wifi); w.write(",");
+
+  w.write("\"rds\":");
+  if (!standbyState && si4703Powered && fmRadio.sursa == 1) {
+    w.writeJsonEscaped(fmRadio.radioTextnow);
+  } else {
+    w.write("\"\"");
+  }
+  w.write(",");
+
+  w.write("\"rpiOnline\":"); w.write(rpiConnected ? "true" : "false"); w.write(",");
+  w.write("\"rpiState\":");  w.writeJsonEscaped(rpiStateBuf);  w.write(",");
+  w.write("\"rpiTitle\":");  w.writeJsonEscaped(rpiTitleBuf);  w.write(",");
+  w.write("\"rpiArtist\":"); w.writeJsonEscaped(rpiArtistBuf); w.write(",");
+  w.write("\"rpiFile\":");   w.writeJsonEscaped(rpiFileBuf);   w.write(",");
+
+  w.write("\"pcOnline\":"); w.write(pcBridgeOk ? "true" : "false"); w.write(",");
+  w.write("\"pcHttpCode\":"); w.writeInt((long)lastPcHttpCode); w.write(",");
+  w.write("\"pcState\":");  w.writeJsonEscaped(pcStateBuf);  w.write(",");
+  w.write("\"pcTitle\":");  w.writeJsonEscaped(pcTitleBuf);  w.write(",");
+  w.write("\"pcArtist\":"); w.writeJsonEscaped(pcArtistBuf); w.write(",");
+  w.write("\"pcExtra\":");  w.writeJsonEscaped(pcExtraBuf);  w.write(",");
+
+  w.write("\"bass\":"); w.writeInt((long)Bass); w.write(",");
+  w.write("\"middle\":"); w.writeInt((long)Middle); w.write(",");
+  w.write("\"treble\":"); w.writeInt((long)Treble); w.write(",");
+  w.write("\"gain\":"); w.writeInt((long)Gain); w.write(",");
+  w.write("\"balance\":"); w.writeInt((long)Balance);
+  w.write("}");
+  w.flush();
+}
+
+// v2: minimal, non-blocking state snapshot for WebUI.
+static void sendStateV2Json(WebServer &srv) {
+  const int wifi = webStatusWifiRssi;
+  const int rssi = (!standbyState && si4703Powered && fmRadio.sursa == 1) ? (int)lastFmRssi : -1;
+
+  WebChunkedWriter w(srv);
+
+  w.write("{");
+  w.write("\"power\":"); w.write(standbyState ? "0" : "1"); w.write(",");
+  w.write("\"mute\":"); w.write(fmRadio.isMuted ? "1" : "0"); w.write(",");
+  w.write("\"volume\":"); w.writeInt((long)fmRadio.currentVolume); w.write(",");
+  w.write("\"source\":"); w.writeInt((long)fmRadio.sursa); w.write(",");
+
+  w.write("\"wifiRssi\":"); w.writeInt((long)wifi); w.write(",");
+
+  // Diagnostics
+  w.write("\"diag\":{");
+  w.write("\"webTaskLastUs\":"); w.writeInt((long)webTaskLastUs); w.write(",");
+  w.write("\"webTaskMaxUs\":"); w.writeInt((long)webTaskMaxUs); w.write(",");
+  w.write("\"webTaskLoops\":"); w.writeInt((long)webTaskLoops); w.write(",");
+  w.write("\"webTaskLastMs\":"); w.writeInt((long)webTaskLastMs); w.write(",");
+  w.write("\"pc\":{");
+  w.write("\"okCount\":"); w.writeInt((long)pcOkCount); w.write(",");
+  w.write("\"failCount\":"); w.writeInt((long)pcFailCount); w.write(",");
+  w.write("\"connectFail\":"); w.writeInt((long)pcConnectFailCount); w.write(",");
+  w.write("\"readFail\":"); w.writeInt((long)pcReadFailCount); w.write(",");
+  w.write("\"lastOkMs\":"); w.writeInt((long)pcLastOkMs); w.write(",");
+  w.write("\"lastFailMs\":"); w.writeInt((long)pcLastFailMs); w.write(",");
+  w.write("\"lastFailCode\":"); w.writeInt((long)pcLastFailCode); w.write(",");
+  w.write("\"lastDtMs\":"); w.writeInt((long)pcLastDtMs);
+  w.write("}");
+  w.write("},");
+
+  // Audio debug snapshot (last TDA write that could affect sound)
+  w.write("\"audio\":{");
+  w.write("\"tdaInput\":"); w.writeInt((long)lastTdaInput); w.write(",");
+  w.write("\"tdaVolume\":"); w.writeInt((long)lastTdaVolume); w.write(",");
+  w.write("\"lastWriteMs\":"); w.writeInt((long)lastTdaWriteMs); w.write(",");
+  w.write("\"why\":"); w.writeJsonEscaped(lastTdaWhy);
+  w.write("},");
+
+  // Tuner
+  w.write("\"tuner\":{");
+  w.write("\"freq\":"); w.writeFloat2((double)fmRadio.currentFrequency); w.write(",");
+  w.write("\"rssi\":"); w.writeInt((long)rssi); w.write(",");
+  w.write("\"rds\":");
+  if (!standbyState && si4703Powered && fmRadio.sursa == 1) w.writeJsonEscaped(fmRadio.radioTextnow);
+  else w.write("\"\"");
+  w.write("},");
+
+  // RPi
+  w.write("\"rpi\":{");
+  w.write("\"online\":"); w.write(rpiConnected ? "true" : "false"); w.write(",");
+  w.write("\"state\":");  w.writeJsonEscaped(rpiStateBuf);  w.write(",");
+  w.write("\"title\":");  w.writeJsonEscaped(rpiTitleBuf);  w.write(",");
+  w.write("\"artist\":"); w.writeJsonEscaped(rpiArtistBuf); w.write(",");
+  w.write("\"file\":");   w.writeJsonEscaped(rpiFileBuf);
+  w.write("},");
+
+  // PC / foobar
+  w.write("\"pc\":{");
+  w.write("\"online\":"); w.write(pcBridgeOk ? "true" : "false"); w.write(",");
+  w.write("\"httpCode\":"); w.writeInt((long)lastPcHttpCode); w.write(",");
+  w.write("\"state\":");  w.writeJsonEscaped(pcStateBuf);  w.write(",");
+  w.write("\"title\":");  w.writeJsonEscaped(pcTitleBuf);  w.write(",");
+  w.write("\"artist\":"); w.writeJsonEscaped(pcArtistBuf); w.write(",");
+  w.write("\"extra\":");  w.writeJsonEscaped(pcExtraBuf);
+  w.write("},");
+
+  // EQ
+  w.write("\"eq\":{");
+  w.write("\"bass\":"); w.writeInt((long)Bass); w.write(",");
+  w.write("\"middle\":"); w.writeInt((long)Middle); w.write(",");
+  w.write("\"treble\":"); w.writeInt((long)Treble); w.write(",");
+  w.write("\"gain\":"); w.writeInt((long)Gain); w.write(",");
+  w.write("\"balance\":"); w.writeInt((long)Balance);
+  w.write("}");
+
+  w.write("}");
+  w.flush();
+}
+
 void updateRpiTitleTicker(bool forceRedraw) {
-  static String lastBaseTitle = "";
-  static String scrollBase = "";
+  static char lastBaseTitle[96] = "";
+  static char scrollBuf[200] = ""; // base + separator, doubled in logic (no heap)
+  static size_t scrollPeriod = 0;  // strlen(scrollBuf) after rebuild
   static size_t scrollIdx = 0;
   static unsigned long lastTickMs = 0;
   const unsigned long TITLE_SCROLL_STEP_MS = 300UL;
 
-  if (standbyState || fmRadio.utilMode || fmRadio.sursa != 3) return;
+  if (standbyState || fmRadio.utilMode || (fmRadio.sursa != 3)) return;
 
-  String baseTitle = rpiTitle;
-  baseTitle.trim();
-  if (baseTitle.length() == 0) baseTitle = "-";
+  char baseTitle[sizeof(rpiTitleBuf)];
+  strncpy(baseTitle, rpiTitleBuf, sizeof(baseTitle) - 1);
+  baseTitle[sizeof(baseTitle) - 1] = '\0';
+  // trim in-place
+  char *b = baseTitle;
+  while (*b == ' ' || *b == '\t') b++;
+  size_t bl = strlen(b);
+  while (bl > 0 && (b[bl - 1] == ' ' || b[bl - 1] == '\t')) bl--;
+  b[bl] = '\0';
+  if (bl == 0) {
+    strcpy(b, "-");
+    bl = 1;
+  }
 
-  if (forceRedraw || baseTitle != lastBaseTitle) {
-    lastBaseTitle = baseTitle;
-    scrollBase = baseTitle + "  ";
+  if (forceRedraw || strcmp(b, lastBaseTitle) != 0) {
+    strncpy(lastBaseTitle, b, sizeof(lastBaseTitle) - 1);
+    lastBaseTitle[sizeof(lastBaseTitle) - 1] = '\0';
+    // Separator must be non-empty so scrolling shows a pause between repeats.
+    snprintf(scrollBuf, sizeof(scrollBuf), "%s  ", lastBaseTitle);
+    scrollPeriod = strlen(scrollBuf);
     scrollIdx = 0;
     lastTickMs = 0;
   }
 
-  const size_t windowLen = 18;
-  bool longTitle = (baseTitle.length() > windowLen);
+  const size_t windowLen = 30;
+  bool longTitle = (strlen(lastBaseTitle) > windowLen);
   unsigned long now = millis();
-  if (!forceRedraw) {
-    if (!longTitle) return;  // static if it fits
-    if (now - lastTickMs < TITLE_SCROLL_STEP_MS) return;
+  if (!longTitle) {
+    // Static title: redraw only when forced or when base changed (handled above).
+    if (!forceRedraw) return;
+  } else {
+    if (!forceRedraw) {
+      if (now - lastTickMs < TITLE_SCROLL_STEP_MS) return;
+    }
+    lastTickMs = now;
   }
-  lastTickMs = now;
 
-  String view;
+  char view[40];
+  memset(view, ' ', sizeof(view));
+  view[windowLen] = '\0';
+
   if (longTitle) {
-    String doubled = scrollBase + scrollBase;
-    if (scrollIdx >= scrollBase.length()) scrollIdx = 0;
-    view = doubled.substring(scrollIdx, scrollIdx + windowLen);
+    if (scrollPeriod == 0) return;
+    if (scrollIdx >= scrollPeriod) scrollIdx = 0;
+    for (size_t i = 0; i < windowLen; i++) {
+      view[i] = scrollBuf[(scrollIdx + i) % scrollPeriod];
+    }
     scrollIdx++;
   } else {
-    view = baseTitle;
+    size_t n = strlen(lastBaseTitle);
+    if (n > windowLen) n = windowLen;
+    memcpy(view, lastBaseTitle, n);
+    for (size_t i = n; i < windowLen; i++) view[i] = ' ';
+    view[windowLen] = '\0';
   }
 
-  fmRadio.tft.fillRect(5, 99, 206, 24, ST77XX_BLACK);
+  // #region agent log: H5 ticker redraw spikes
+  uint32_t t0 = micros();
+  // #endregion
+  fmRadio.tft.fillRect(0, 99, SCREEN_WIDTH, 24, ST77XX_BLACK);
   fmRadio.tft.setTextColor(ST77XX_YELLOW);
   fmRadio.tft.setTextSize(2);
-  fmRadio.tft.setCursor(5, 101);
+  fmRadio.tft.setCursor(0, 101);
   fmRadio.tft.print(view);
-}
-
-void drawRpiBargraph(bool forceRedraw) {
-  if (standbyState || fmRadio.utilMode || fmRadio.sursa != 3) return;
-
-  const int graphX = 222;
-  const int barW = 7;
-  const int gap = 1;
-  const int bars = 12;
-  const int topY = 74;
-  const int midY = 128;
-  const int bottomY = 190;
-  const int topH = midY - topY - 2;
-  const int bottomH = bottomY - 136;
-  const int maxH = (topH < bottomH) ? topH : bottomH;
-
-  static int prevL[12];
-  static int prevR[12];
-  static bool init = false;
-  if (!init || forceRedraw) {
-    for (int i = 0; i < bars; i++) {
-      prevL[i] = -1;
-      prevR[i] = -1;
-    }
-    init = true;
-    fmRadio.tft.fillRect(214, 60, 106, 140, ST77XX_BLACK);
-    fmRadio.tft.setTextSize(1);
-    fmRadio.tft.setTextColor(ST77XX_CYAN);
-    fmRadio.tft.setCursor(216, 64);
-    fmRadio.tft.print("L");
-    fmRadio.tft.setCursor(216, 132);
-    fmRadio.tft.print("R");
-  }
-
-  for (int i = 0; i < bars; i++) {
-    int x = graphX + i * (barW + gap);
-    int hL = map((int)rpiFftL[i], 0, 255, 0, maxH);
-    int hR = map((int)rpiFftR[i], 0, 255, 0, maxH);
-
-    if (prevL[i] != hL || forceRedraw) {
-      fmRadio.tft.fillRect(x, midY - maxH, barW, maxH, ST77XX_BLACK);
-      if (hL > 0) fmRadio.tft.fillRect(x, midY - hL, barW, hL, ST77XX_WHITE);
-      prevL[i] = hL;
-    }
-    if (prevR[i] != hR || forceRedraw) {
-      fmRadio.tft.fillRect(x, bottomY - maxH, barW, maxH, ST77XX_BLACK);
-      if (hR > 0) fmRadio.tft.fillRect(x, bottomY - hR, barW, hR, ST77XX_WHITE);
-      prevR[i] = hR;
-    }
-  }
+  // #region agent log: H5 ticker redraw spikes
+  uint32_t dt = micros() - t0;
+  if (dt > profTickerUsMax) profTickerUsMax = dt;
+  profTickerDraws++;
+  // #endregion
 }
 
 void updateRpiPlayIndicator(bool forceRedraw) {
@@ -1482,9 +2398,17 @@ void updateRpiPlayIndicator(bool forceRedraw) {
   static bool lastActive = false;
   static bool lastShown = false;
 
+  // În standby nu atingem TFT-ul aici — altfel fillCircle gri la y~13 suprascrie header-ul ceasului.
+  if (standbyState) {
+    lastActive = false;
+    lastShown = false;
+    rpiBlinkOn = false;
+    return;
+  }
+
   // Keep indicator off in standby/util screens.
   bool activeScreen = !standbyState && !fmRadio.utilMode;
-  bool rpiPlaying = rpiState.equalsIgnoreCase("play") || rpiState.equalsIgnoreCase("playing");
+  bool rpiPlaying = rpiPlayingFromState(rpiStateBuf);
   bool active = activeScreen && rpiConnected && rpiPlaying;
 
   unsigned long now = millis();
@@ -1514,17 +2438,18 @@ void updateRpiTransportPlayIcon(bool forceRedraw) {
   static bool lastValid = false;
   static bool lastPlaying = false;
 
-  bool activeScreen = !standbyState && !fmRadio.utilMode && fmRadio.sursa == 3;
+  bool activeScreen = !standbyState && !fmRadio.utilMode && (fmRadio.sursa == 3 || fmRadio.sursa == 4 || fmRadio.sursa == 5);
   if (!activeScreen) {
     lastValid = false;
     return;
   }
 
-  bool rpiIsPlaying = rpiState.equalsIgnoreCase("play") || rpiState.equalsIgnoreCase("playing");
+  const char *st = (fmRadio.sursa == 5) ? pcStateBuf : ((fmRadio.sursa == 4) ? pcStateBuf : rpiStateBuf);
+  bool rpiIsPlaying = rpiPlayingFromState(st);
   if (!forceRedraw && lastValid && (lastPlaying == rpiIsPlaying)) return;
 
-  // Middle RPI control button: orange background + icon that indicates next action.
-  fmRadio.tft.fillRect(72, 149, 70, 45, ST77XX_ORANGE);
+  // Middle transport button: orange background + icon that indicates next action.
+  fmRadio.tft.fillRect(TRANSPORT_BTN1_X, TRANSPORT_ROW_Y, TRANSPORT_BTN_W, TRANSPORT_ROW_H, ST77XX_ORANGE);
   if (rpiIsPlaying) {
     fmRadio.tft.fillRect(99, 161, 6, 20, ST77XX_WHITE);
     fmRadio.tft.fillRect(111, 161, 6, 20, ST77XX_WHITE);
@@ -1553,13 +2478,24 @@ void enterStandby() {
   // Reset encoder count so movement during standby is ignored
   setEncoderCount(0);
   encoderLastEncVal = 0;
-  
-  // Drive standby output LOW when entering standby (standby = power OFF)
-  digitalWrite(STANDBY_OUT_PIN, LOW);
 
-  tda7439.setVolume(0);
+  // Mute TDA7439 + stare UI (fără updateVolumeDisplay — urmează fillScreen în showtimestandBy)
+  if (!fmRadio.isMuted) {
+    fmRadio.isMuted = true;
+    Wire.beginTransmission(0x44);
+    if (Wire.endTransmission() == 0) {
+      tda7439.setVolume(0);
+    }
+    setEncoderCount(fmRadio.currentVolume);
+    fmRadio.saveSettings();
+  } else {
+    Wire.beginTransmission(0x44);
+    if (Wire.endTransmission() == 0) {
+      tda7439.setVolume(0);
+    }
+  }
 
-  Serial.println("Entering Standby mode");
+  // Serial.println("Entering Standby mode");
   // Immediately render standby clock/date so the screen isn't left blank
   showtimestandBy();
 }
@@ -1571,8 +2507,6 @@ void exitStandby() {
   rtc.begin();
   delay(10);
 
-  // Drive standby output HIGH when exiting standby (active = power ON)
-  digitalWrite(STANDBY_OUT_PIN, HIGH);
   delay(500); // Wait for components to stabilize
 
   // Reinit I2C si initializeaza SI4703 la power ON
@@ -1591,11 +2525,12 @@ void exitStandby() {
   fmRadio.drawInitialScreen();
   fmRadio.updateModeDisplay();
   fmRadio.updateSelectedSourceDisplay();
-  Serial.println("Exit standby mode");
+  // Serial.println("Exit standby mode");
   forceFullTimeRedraw = true;  // Force full redraw on next time update
 
-  // Set volume to fixed startup value
+  // Set volume to fixed startup value (ieșire din standby = fără mute pe UI, aliniat cu TDA)
   fmRadio.currentVolume = 10;
+  fmRadio.isMuted = false;
   setEncoderCount(fmRadio.currentVolume);
   encoderLastEncVal = fmRadio.currentVolume;
   fmRadio.updateVolumeDisplay();
@@ -1626,8 +2561,9 @@ void showTime() {
     return;
   }
 
-  // On Raspberry source, do not draw time/date.
-  if (FMRadioController::instance->sursa == 3) {
+  // On Raspberry and PC (foobar) sources, do not draw time/date.
+  // These sources use the mid-screen area for transport/UI and time can leave artifacts.
+  if (FMRadioController::instance->sursa == 3 || FMRadioController::instance->sursa == 4 || FMRadioController::instance->sursa == 5) {
     return;
   }
 
@@ -1727,6 +2663,7 @@ void showtimestandBy() {
   }
   bool dayDateChanged = (strcmp(prevDayStr, dayStr) != 0 || strcmp(prevDateStr, dateStr) != 0);
   bool needFullStandbyRedraw = forceFullTimeRedraw || standbyFullRedrawPending;
+  const bool standbyDidFullRedraw = needFullStandbyRedraw;
   bool needRedrawClock = needFullStandbyRedraw || anyTimeSlotChanged || dayDateChanged;
 
   static char prevStandbyIp[24] = "";
@@ -1824,6 +2761,65 @@ void showtimestandBy() {
     fmRadio.tft.print(rssiBuf);
     prevStandbyRssi = rssi;
   }
+
+  // RPI / Moode: în play → punct verde care alternează la ~1 s; altfel stare statică
+  {
+    const int rpiBandY = 0;
+    const int rpiBandH = 40;
+    const int dotCx = 16;
+    const int dotCy = 18;
+    const int dotR = 7;
+    bool playing = rpiConnected && rpiPlayingFromState(rpiStateBuf);
+    unsigned long tsec = millis() / 1000UL;
+    bool flashBright = ((tsec % 2UL) == 0UL);
+
+    static unsigned long lastStandbyRpiDrawSec = 0xFFFFFFFFUL;
+    static bool lastStandbyRpiConn = false;
+    static bool lastStandbyRpiPlay = false;
+
+    bool conn = rpiConnected;
+    bool needRpiBand = standbyDidFullRedraw
+        || (conn != lastStandbyRpiConn)
+        || (playing != lastStandbyRpiPlay)
+        || (playing && (tsec != lastStandbyRpiDrawSec));
+
+    if (needRpiBand) {
+      if (playing) {
+        lastStandbyRpiDrawSec = tsec;
+      } else {
+        lastStandbyRpiDrawSec = 0xFFFFFFFFUL;
+      }
+      lastStandbyRpiConn = conn;
+      lastStandbyRpiPlay = playing;
+
+      fmRadio.tft.fillRect(0, rpiBandY, SCREEN_WIDTH, rpiBandH, ST77XX_BLACK);
+      uint16_t dotCol;
+      if (!conn) {
+        dotCol = CUSTOM_GREY;
+      } else if (playing) {
+        dotCol = flashBright ? ST77XX_GREEN : CUSTOM_DARKGREEN;  // ~1 s alternanță
+      } else {
+        dotCol = ST77XX_CYAN;
+      }
+      fmRadio.tft.fillCircle(dotCx, dotCy, dotR, dotCol);
+      fmRadio.tft.setTextSize(2);
+      fmRadio.tft.setTextColor(ST77XX_WHITE);
+      fmRadio.tft.setCursor(32, 8);
+      fmRadio.tft.print("RPI");
+      fmRadio.tft.setTextSize(1);
+      fmRadio.tft.setTextColor(CUSTOM_LIGHTGREY);
+      fmRadio.tft.setCursor(92, 14);
+      if (!conn) {
+        fmRadio.tft.print("Moode: --");
+      } else if (playing) {
+        fmRadio.tft.setTextColor(flashBright ? ST77XX_GREEN : CUSTOM_GREY);
+        fmRadio.tft.print("Moode: PLAY");
+      } else {
+        fmRadio.tft.print("Moode: ");
+        fmRadio.tft.print(rpiStateBuf);
+      }
+    }
+  }
 }
 
 //------------------------------------
@@ -1831,6 +2827,7 @@ void showtimestandBy() {
 //------------------------------------
 void checkTouch() {
   static bool rpiTouchLatched = false;
+  static unsigned long lastTouchDbgMs = 0;
   if (!FMRadioController::instance->ts.touched()) {
     rpiTouchLatched = false;
     return;
@@ -1839,39 +2836,83 @@ void checkTouch() {
     TS_Point p = FMRadioController::instance->ts.getPoint();
     int mappedX, mappedY;
     FMRadioController::instance->mapTouch(p.x, p.y, mappedX, mappedY);
+    // Hit-test coordinate (0,0 = top-left).
+    const int ux = mappedX;
+
+  // Touch debug: print raw + mapped coordinates (throttled).
+  // Enable by setting TOUCH_DEBUG to 1 (and DEBUG_SERIAL_LOGS to 1).
+#ifndef TOUCH_DEBUG
+#define TOUCH_DEBUG 0
+#endif
+#if TOUCH_DEBUG && DEBUG_SERIAL_LOGS
+    if (millis() - lastTouchDbgMs > 120) {
+      lastTouchDbgMs = millis();
+      Serial.print("[TOUCH] raw=(");
+      Serial.print(p.x);
+      Serial.print(",");
+      Serial.print(p.y);
+      Serial.print(") z=");
+      Serial.print(p.z);
+      Serial.print(" mapped=(");
+      Serial.print(mappedX);
+      Serial.print(",");
+      Serial.print(mappedY);
+      Serial.print(") sursa=");
+      Serial.println(FMRadioController::instance->sursa);
+    }
+#endif
 
     if (p.z > 10) {
       if (FMRadioController::instance->utilMode) lastUtilActivity = millis();
-      // RTC button (bottom left)
-      if (FMRadioController::instance->utilMode && mappedX >= 260 && mappedX <= 320 && mappedY >= 0 && mappedY <= 40) {
-        FMRadioController::instance->rtcUpdateSuccess = syncRTCWithNTPRetries();
-        FMRadioController::instance->rtcUpdateMsgMillis = millis();
-        FMRadioController::instance->drawUtilButton();
-        drawsetScreen();
-        return;
-      }
-      // Check if touch is within the Util/Back button area (top left)
-      if (mappedX >= 0 && mappedX <= 60 && mappedY >= 0 && mappedY <= 40) {
-        static unsigned long lastUtil = 0;
-        if (millis() - lastUtil < 700) return;  // debounce = 700 ms ca in toggleUtilMode
-        lastUtil = millis();
-        FMRadioController::instance->utilMode = !FMRadioController::instance->utilMode;
-        FMRadioController::instance->toggleUtilMode();
-        Serial.println(FMRadioController::instance->utilMode);
-        return;
+      // Util-mode buttons are drawn at the bottom:
+      // - RTC: bottom-left (0,200..60x40)
+      // - Back: bottom-right (SETUP_BUTTON_*)
+      if (FMRadioController::instance->utilMode) {
+        // RTC button (bottom-left)
+        if (mappedX >= 0 && mappedX <= 60 && mappedY >= 200 && mappedY <= (SCREEN_HEIGHT - 1)) {
+          FMRadioController::instance->rtcUpdateSuccess = syncRTCWithNTPRetries();
+          FMRadioController::instance->rtcUpdateMsgMillis = millis();
+          FMRadioController::instance->drawUtilButton();
+          drawsetScreen();
+          return;
+        }
+        // Back button (bottom-right)
+        if (mappedX >= SETUP_BUTTON_X_MIN && mappedX <= (SETUP_BUTTON_X_MIN + SETUP_BUTTON_WIDTH - 1) &&
+            mappedY >= SETUP_BUTTON_Y_MIN && mappedY <= (SETUP_BUTTON_Y_MIN + SETUP_BUTTON_HEIGHT - 1)) {
+          static unsigned long lastUtil = 0;
+          if (millis() - lastUtil < 700) return;  // debounce = 700 ms ca in toggleUtilMode
+          lastUtil = millis();
+          FMRadioController::instance->utilMode = false;
+          FMRadioController::instance->toggleUtilMode();
+          return;
+        }
+      } else {
+        // Main screen: Util button (bottom-right)
+        if (mappedX >= SETUP_BUTTON_X_MIN && mappedX <= (SETUP_BUTTON_X_MIN + SETUP_BUTTON_WIDTH - 1) &&
+            mappedY >= SETUP_BUTTON_Y_MIN && mappedY <= (SETUP_BUTTON_Y_MIN + SETUP_BUTTON_HEIGHT - 1)) {
+          static unsigned long lastUtil = 0;
+          if (millis() - lastUtil < 700) return;  // debounce = 700 ms ca in toggleUtilMode
+          lastUtil = millis();
+          FMRadioController::instance->utilMode = true;
+          FMRadioController::instance->toggleUtilMode();
+          return;
+        }
       }
       // In util (setup) mode, change sursa by touching the lower part.
       if (mappedY > 180 && FMRadioController::instance->utilMode) {
         int newSursa = 0;
-        if (mappedX < 80) newSursa = 1;
-        else if (mappedX < 160) newSursa = 2;
-        else if (mappedX < 240) newSursa = 3;
-        else if (mappedX < 320) newSursa = 4;
+        // Treat PCD as a real source here too (5 segments, same order as top bar).
+        const int idx = constrain(ux / 64, 0, 4);
+        static const int kSourceByIndex[5] = { 4, 5, 3, 2, 1 };
+        newSursa = kSourceByIndex[idx];
         if (newSursa != 0 && newSursa != FMRadioController::instance->sursa) {
           // Save current settings before switching.
           FMRadioController::instance->saveSettings();
           // Update sursa.
           FMRadioController::instance->sursa = newSursa;
+          // Keep MCP source logic from overwriting the touch-selected source.
+          FMRadioController::instance->sursaVeche = FMRadioController::instance->sursa;
+          FMRadioController::instance->lastSourceChangeMs = millis();
           // Load and apply EQ/gain/input/volume for the new source
           FMRadioController::instance->loadEqualizer();
           applyTDA7439SettingsForCurrentSource();
@@ -1885,24 +2926,55 @@ void checkTouch() {
       }
       // Process non-util touches.
       if (!FMRadioController::instance->utilMode) {
-        // RPI controls: include both normal and Y-inverted calibration bands
-        bool rpiButtonBand = ((mappedY >= 140 && mappedY <= 202) || (mappedY >= 38 && mappedY <= 100));
-        if (FMRadioController::instance->sursa == 3 && rpiButtonBand) {
-          int rpiTouchX = constrain(mappedX + RPI_TOUCH_X_OFFSET, 0, SCREEN_WIDTH - 1);
-          int rpiButton = -1;
-          if (rpiTouchX <= 71) rpiButton = 0;         // left button
-          else if (rpiTouchX <= 143) rpiButton = 1;   // center button
-          else if (rpiTouchX <= 214) rpiButton = 2;   // right button
+        // Top source bar: 5 buttons (PCA, PCD, RPI, BT, TUN) across 320px => 64px each.
+        if (mappedY >= 0 && mappedY <= 60) {
+          int newSursa = 0;
+          const int idx = constrain(ux / 64, 0, 4);
+          // Display order: PCA, PCD, RPI, BT, TUN
+          static const int kSourceByIndex[5] = { 4, 5, 3, 2, 1 };
+          newSursa = kSourceByIndex[idx];
+          if (newSursa != 0 && newSursa != FMRadioController::instance->sursa) {
+            FMRadioController::instance->sursa = newSursa;
+            FMRadioController::instance->sursaVeche = FMRadioController::instance->sursa;
+            FMRadioController::instance->lastSourceChangeMs = millis();
+            // PCA shows "PC analogic" overlay; PCD shows Foobar metadata.
+            if (newSursa == 4) pcAnalogUi = true;
+            else if (newSursa == 5) pcAnalogUi = false;
+            FMRadioController::instance->loadEqualizer();
+            applyTDA7439SettingsForCurrentSource();
+            FMRadioController::instance->updateSelectedSourceDisplay();
+            FMRadioController::instance->updateMainContent();
+            FMRadioController::instance->saveSettings();
+          }
+          return;
+        }
+        // Transport row band (Prev/Play/Next) - should match draw positions.
+        const bool rpiButtonBand =
+          (mappedY >= (TRANSPORT_ROW_Y - 5)) &&
+          (mappedY <= (TRANSPORT_ROW_Y + TRANSPORT_ROW_H + 5));
+        // RPI + PC transport: aceleași dreptunghiuri; Prev/Play/Next = aceeași mapare tx ca la RPi
+        // IMPORTANT: toate hitbox-urile sunt în coordonata tx (mappedX + offset),
+        // altfel PCA/PCD și Prev/Play/Next se decalibrează relativ unul față de altul.
+        if ((FMRadioController::instance->sursa == 3 || FMRadioController::instance->sursa == 5) && rpiButtonBand) {
+          int tx = constrain(mappedX + RPI_TOUCH_X_OFFSET, 0, SCREEN_WIDTH - 1);
+          int tbtn = -1;
+          if (tx <= TRANSPORT_TX_MAX0) tbtn = 0;
+          else if (tx <= TRANSPORT_TX_MAX1) tbtn = 1;
+          else if (tx <= TRANSPORT_TX_MAX2) tbtn = 2;
 
-          if (rpiButton >= 0) {
+          if (tbtn >= 0) {
             if (!rpiTouchLatched) {
               rpiTouchLatched = true;
-              if (rpiButton == 0) {
-                sendRpiCommand("NEXT");      // swap PREV/NEXT to match on-screen behavior
-              } else if (rpiButton == 1) {
-                sendRpiCommand("PLAYPAUSE");
-              } else {
-                sendRpiCommand("PREV");
+              if (FMRadioController::instance->sursa == 3) {
+                // RPi: Moode controls
+                if (tbtn == 0) sendRpiCommand("NEXT"); // swap PREV/NEXT to match on-screen behavior
+                else if (tbtn == 1) sendRpiCommand("PLAYPAUSE");
+                else sendRpiCommand("PREV");
+              } else { // PCA/PCD: foobar controls
+                // Foobar: keep natural mapping (left=PREV, right=NEXT).
+                if (tbtn == 0) sendPcCommand("PREV");
+                else if (tbtn == 1) sendPcCommand("PLAYPAUSE");
+                else sendPcCommand("NEXT");
               }
             }
           } else {
@@ -1911,23 +2983,25 @@ void checkTouch() {
           }
           return;
         }
-        if (mappedX >= SEEK_BUTTON_X_MIN && mappedX <= SEEK_BUTTON_X_MAX && mappedY >= SEEK_BUTTON_Y_MIN && mappedY <= SEEK_BUTTON_Y_MAX) {
+        if (mappedX >= SEEK_UP_X_MIN && mappedX <= SEEK_UP_X_MAX && mappedY >= SEEK_UP_Y_MIN && mappedY <= SEEK_UP_Y_MAX) {
           FMRadioController::instance->seekUp();
           FMRadioController::instance->updateMainContent();
           FMRadioController::instance->saveSettings();
         }
-        if (mappedX >= SEEK_BUTTON_Z_MIN && mappedX <= SEEK_BUTTON_Z_MAX && mappedY >= SEEK_BUTTON_W_MIN && mappedY <= SEEK_BUTTON_W_MAX) {
+        if (mappedX >= SEEK_DN_X_MIN && mappedX <= SEEK_DN_X_MAX && mappedY >= SEEK_DN_Y_MIN && mappedY <= SEEK_DN_Y_MAX) {
           FMRadioController::instance->seekDown();
           FMRadioController::instance->updateMainContent();
           FMRadioController::instance->saveSettings();
         } else if (mappedY > 180) {
           int newSursa = 0;
-          if (mappedX < 80) newSursa = 1;
-          else if (mappedX < 160) newSursa = 2;
-          else if (mappedX < 240) newSursa = 3;
-          else if (mappedX < 320) newSursa = 4;
+          // Bottom quick source select: 5 segments, same order as top bar.
+          const int idx = constrain(ux / 64, 0, 4);
+          static const int kSourceByIndex[5] = { 4, 5, 3, 2, 1 };
+          newSursa = kSourceByIndex[idx];
           if (newSursa != 0 && newSursa != FMRadioController::instance->sursa) {
             FMRadioController::instance->sursa = newSursa;
+            FMRadioController::instance->sursaVeche = FMRadioController::instance->sursa;
+            FMRadioController::instance->lastSourceChangeMs = millis();
             // Load and apply EQ/gain/input/volume for the new source
             FMRadioController::instance->loadEqualizer();
             applyTDA7439SettingsForCurrentSource();
@@ -1974,26 +3048,26 @@ void checkTouch() {
         lastUtilActivity = millis();
       };
 
-      // Zone touch EQ +/- (Y conform calibrarii touch-ului tau - sursa/RTC/Back merg bine)
-      if (mappedX >= 240 && mappedX <= 320) {
-        if (mappedY >= 128 && mappedY <= 168)
+      // UTIL EQ +/-: same column order and Y bands as drawsetScreen() (Bass..Gain left→right).
+      if (mappedX >= 0 && mappedX <= 79) {
+        if (mappedY >= UTIL_EQ_PLUS_Y_MIN && mappedY <= UTIL_EQ_PLUS_Y_MAX)
           adjustSetting(Bass, 1, -7, 7, 14, 134);
-        else if (mappedY >= 44 && mappedY <= 84)
+        else if (mappedY >= UTIL_EQ_MINUS_Y_MIN && mappedY <= UTIL_EQ_MINUS_Y_MAX)
           adjustSetting(Bass, -1, -7, 7, 14, 134);
-      } else if (mappedX >= 160 && mappedX <= 239) {
-        if (mappedY >= 128 && mappedY <= 168)
-          adjustSetting(Middle, 1, -7, 7, 94, 134);
-        else if (mappedY >= 44 && mappedY <= 84)
-          adjustSetting(Middle, -1, -7, 7, 94, 134);
       } else if (mappedX >= 80 && mappedX <= 159) {
-        if (mappedY >= 128 && mappedY <= 168)
+        if (mappedY >= UTIL_EQ_PLUS_Y_MIN && mappedY <= UTIL_EQ_PLUS_Y_MAX)
+          adjustSetting(Middle, 1, -7, 7, 94, 134);
+        else if (mappedY >= UTIL_EQ_MINUS_Y_MIN && mappedY <= UTIL_EQ_MINUS_Y_MAX)
+          adjustSetting(Middle, -1, -7, 7, 94, 134);
+      } else if (mappedX >= 160 && mappedX <= 239) {
+        if (mappedY >= UTIL_EQ_PLUS_Y_MIN && mappedY <= UTIL_EQ_PLUS_Y_MAX)
           adjustSetting(Treble, 1, -7, 7, 174, 134);
-        else if (mappedY >= 44 && mappedY <= 84)
+        else if (mappedY >= UTIL_EQ_MINUS_Y_MIN && mappedY <= UTIL_EQ_MINUS_Y_MAX)
           adjustSetting(Treble, -1, -7, 7, 174, 134);
-      } else if (mappedX >= 0 && mappedX <= 79) {
-        if (mappedY >= 128 && mappedY <= 168)
+      } else if (mappedX >= 240 && mappedX <= (SCREEN_WIDTH - 1)) {
+        if (mappedY >= UTIL_EQ_PLUS_Y_MIN && mappedY <= UTIL_EQ_PLUS_Y_MAX)
           adjustSetting(Gain, 1, -45, 0, 259, 134);
-        else if (mappedY >= 44 && mappedY <= 84)
+        else if (mappedY >= UTIL_EQ_MINUS_Y_MIN && mappedY <= UTIL_EQ_MINUS_Y_MAX)
           adjustSetting(Gain, -1, -45, 0, 259, 134);
       }
     }
@@ -2021,6 +3095,25 @@ const uint8_t NTP_SYNC_MAX_RETRIES = 3;
 const unsigned long NTP_RETRY_DELAY_MS = 1000UL;
 static unsigned long nextNtpSyncDueMs = 0; // first cycle at boot, then hourly
 
+#if defined(ARDUINO_ARCH_ESP32)
+static TaskHandle_t ntpSyncTaskHandle = nullptr;
+static volatile bool ntpSyncInProgress = false;
+static volatile bool ntpSyncRequested = false;
+
+static void ntpSyncTask(void *param) {
+  (void)param;
+  for (;;) {
+    // Wait until loop() schedules a sync
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ntpSyncInProgress = true;
+    ntpSyncRequested = false;
+    // Serial.println("[NTP] Background sync task running...");
+    syncRTCWithNTPRetries();
+    ntpSyncInProgress = false;
+  }
+}
+#endif
+
 //------------------------------------
 // WiFi + NTP Sync Function
 //------------------------------------
@@ -2030,17 +3123,19 @@ void connectToWiFi() {
   // Reduce latency caused by WiFi modem sleep
   WiFi.setSleep(false);
   WiFi.setHostname("flo-amp");
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to WiFi");
   Serial.print("SSID: ");
   Serial.println(ssid);
 
-  // Wait up to 20 seconds for connection
+  // Wait up to 15 seconds (tighter poll so Web UI / setup can continue sooner when AP is quick).
   unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
     Serial.print(".");
-    delay(500);
+    delay(120);
+    yield();
   }
 
   // Check result
@@ -2059,29 +3154,73 @@ void connectToWiFi() {
   }
 }
 
+// Dupa multe ore / standby, AP-ul poate deconecta clientul; fara reconectare ramane fara IP si Web UI + mDNS nu raspund.
+void maintainWiFiConnection() {
+  static wl_status_t prevWifi = WL_IDLE_STATUS;
+  static unsigned long lastReconnectMs = 0;
+  const wl_status_t st = WiFi.status();
+
+  if (st == WL_CONNECTED) {
+    if (prevWifi != WL_CONNECTED && prevWifi != WL_IDLE_STATUS && prevWifi != WL_NO_SHIELD) {
+#if defined(ARDUINO_ARCH_ESP32)
+      MDNS.end();
+      delay(30);
+      if (MDNS.begin("flo-amp")) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("mDNS OK (dupa reconectare): http://flo-amp.local");
+      } else {
+        Serial.println("mDNS esuat dupa reconectare — foloseste IP-ul");
+      }
+#endif
+      Serial.print("Web UI:  http://");
+      Serial.println(WiFi.localIP());
+    }
+    prevWifi = st;
+    return;
+  }
+
+  if (prevWifi == WL_CONNECTED) {
+    Serial.println("[WiFi] legatura pierduta — se incearca reconectarea periodica");
+  }
+  prevWifi = st;
+
+  const unsigned long now = millis();
+  if (now - lastReconnectMs < 20000UL) return;
+  lastReconnectMs = now;
+
+  WiFi.disconnect(false);
+  delay(50);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setHostname("flo-amp");
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+  Serial.println("[WiFi] WiFi.begin() (mentenanta)");
+}
+
 
 bool syncRTCWithNTP() {
   // Romania timezone with automatic DST (EET/EEST)
   configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4", "pool.ntp.org", "time.nist.gov");
 
-  Serial.print("Waiting for NTP time sync");
+  // Serial.print("Waiting for NTP time sync");
   const unsigned long ntpTimeoutMs = 12000;  // max 12 s ca setup-ul sa continue si web/mDNS sa porneasca
   unsigned long startMs = millis();
   time_t nowSecs = time(nullptr);
   while (nowSecs < 8 * 3600 * 2 && (millis() - startMs) < ntpTimeoutMs) {
     delay(500);
-    Serial.print(".");
+    // Serial.print(".");
     nowSecs = time(nullptr);
   }
   if ((millis() - startMs) >= ntpTimeoutMs) {
-    Serial.println(" timeout (continuing without NTP).");
+    // Serial.println(" timeout (continuing without NTP).");
     return false;
   }
-  Serial.println(" done.");
+  // Serial.println(" done.");
 
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
-    Serial.println("Failed to obtain time");
+    // Serial.println("Failed to obtain time");
     return false;
   }
 
@@ -2094,24 +3233,24 @@ bool syncRTCWithNTP() {
     timeinfo.tm_min,
     timeinfo.tm_sec));
 
-  Serial.println("RTC updated with NTP time.");
+  // Serial.println("RTC updated with NTP time.");
   return true;
 }
 
 bool syncRTCWithNTPRetries() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[NTP] WiFi not connected, skipping sync cycle.");
+    // Serial.println("[NTP] WiFi not connected, skipping sync cycle.");
     return false;
   }
 
   for (uint8_t attempt = 1; attempt <= NTP_SYNC_MAX_RETRIES; attempt++) {
-    Serial.print("[NTP] Sync attempt ");
-    Serial.print(attempt);
-    Serial.print("/");
-    Serial.println(NTP_SYNC_MAX_RETRIES);
+    // Serial.print("[NTP] Sync attempt ");
+    // Serial.print(attempt);
+    // Serial.print("/");
+    // Serial.println(NTP_SYNC_MAX_RETRIES);
 
     if (syncRTCWithNTP()) {
-      Serial.println("[NTP] Sync successful.");
+      // Serial.println("[NTP] Sync successful.");
       return true;
     }
 
@@ -2120,32 +3259,162 @@ bool syncRTCWithNTPRetries() {
     }
   }
 
-  Serial.println("[NTP] 3 failed attempts. Keeping RTC time until next scheduled sync.");
+  // Serial.println("[NTP] 3 failed attempts. Keeping RTC time until next scheduled sync.");
   return false;
 }
 
+static bool serial2TryWriteBytes(const uint8_t *data, size_t len) {
+  if (!len) return true;
+  if (Serial2.availableForWrite() < (int)len) return false;
+  return Serial2.write(data, len) == len;
+}
+
+static bool rpiUartEnabled = false;
+bool rpiBridgeArmed = false;
+
+static bool serial2TryPrint(const char *s) {
+  if (!rpiUartEnabled) return false;
+  if (!s) return true;
+  size_t len = strlen(s);
+  return serial2TryWriteBytes((const uint8_t *)s, len);
+}
+
+static inline bool isRpiContextActive() {
+  // Keep all other sources fully independent from RPi boot/noise.
+  // Enable UART only when the active source is actually RPI (not standby, not PCD).
+  // NOTE: `rpiBridgeArmed` was previously required to avoid UART noise, but it can leave RPI "offline"
+  // after reboot or certain source transitions. For reliability, keep UART active whenever source=RPI.
+  return (!standbyState) && (fmRadio.sursa == 3) && (!pcdMode);
+}
+
 void initRpiSerial() {
+#if defined(ARDUINO_ARCH_ESP32)
+  Serial2.setTxBufferSize(2048);
+  Serial2.setRxBufferSize(2048);
+#endif
   Serial2.begin(RPI_SERIAL_BAUD, SERIAL_8N1, RPI_SERIAL_RX_PIN, RPI_SERIAL_TX_PIN);
+  rpiRxLen = 0;
+  // Treat "no STAT yet" as quiet since boot — avoids `(millis()-0) >= 1800` looking like infinite RX silence.
+  lastRpiRxMs = millis();
   Serial.printf("[RPI] Serial bridge initialized RX=%d TX=%d @%d\n", RPI_SERIAL_RX_PIN, RPI_SERIAL_TX_PIN, RPI_SERIAL_BAUD);
 }
 
-void sendRpiCommand(const char *cmd) {
+static void setRpiUartEnabled(bool enabled) {
+  if (enabled == rpiUartEnabled) return;
+  rpiUartEnabled = enabled;
+  if (enabled) {
+    initRpiSerial();
+  } else {
+    // Fully stop UART interrupts when RPi is irrelevant (prevents boot-noise flooding WiFi/WebUI).
+    Serial2.end();
+    pinMode(RPI_SERIAL_RX_PIN, INPUT_PULLUP);
+    rpiRxLen = 0;
+    rpiForceGetAtMs = 0;
+    rpiWebCmdNextTryMs = 0;
+    rpiWebCmdPending = false;
+    rpiConnected = false;
+  }
+}
+
+bool sendRpiCommand(const char *cmd) {
   unsigned long now = millis();
-  String cmdStr = String(cmd);
+  if (!cmd) return true;
+  if (!rpiUartEnabled) return false;
   // Guard against accidental command floods (especially PLAYPAUSE).
-  if (cmdStr == "PLAYPAUSE" && (now - lastRpiCmdTxMs) < 450UL) return;
-  if (cmdStr == lastRpiCmdTx && (now - lastRpiCmdTxMs) < 200UL) return;
-  lastRpiCmdTx = cmdStr;
+  if (streqLower(cmd, "PLAYPAUSE") && (now - lastRpiCmdTxMs) < 450UL) return true;
+  if (lastRpiCmdTxBuf[0] && streqLower(cmd, lastRpiCmdTxBuf) && (now - lastRpiCmdTxMs) < 200UL) return true;
+
+  char line[80];
+  int n = snprintf(line, sizeof(line), "CMD|%s\n", cmd);
+  if (n <= 0 || n >= (int)sizeof(line)) return true;
+  if (Serial2.availableForWrite() < n) return false;
+
+  strncpy(lastRpiCmdTxBuf, cmd, sizeof(lastRpiCmdTxBuf) - 1);
+  lastRpiCmdTxBuf[sizeof(lastRpiCmdTxBuf) - 1] = '\0';
   lastRpiCmdTxMs = now;
-  Serial.printf("[RPI] TX CMD: %s\n", cmd);
-  Serial2.print("CMD|");
-  Serial2.print(cmd);
-  Serial2.print('\n');
+  Serial2.write((const uint8_t *)line, (size_t)n);
+
+  // Moode/MPD metadata can lag slightly after transport commands.
+  // Schedule a short follow-up GET so the UI gets fresh title/artist after PREV/NEXT/PLAYPAUSE.
+  if (streqLower(cmd, "PREV") || streqLower(cmd, "NEXT") || streqLower(cmd, "PLAYPAUSE")) {
+    rpiForceGetAtMs = now + 220UL;
+  }
+  return true;
+}
+
+bool sendPcCommand(const char *cmd) {
+  if (!cmd || !cmd[0]) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!PC_BRIDGE_HOST || !PC_BRIDGE_HOST[0]) return false;
+
+  HTTPClient http;
+  String url;
+  url.reserve(96);
+  url = "http://";
+  url += PC_BRIDGE_HOST;
+  url += ":";
+  url += String(PC_BRIDGE_PORT);
+  url += "/cmd?c=";
+  url += cmd;
+
+  http.setTimeout(PC_BRIDGE_TIMEOUT_MS);
+  if (!http.begin(url)) return false;
+  int code = http.GET();
+  http.end();
+  bool ok = (code >= 200 && code < 300);
+  // After transport commands, foobar/beefweb may report new metadata with a short delay.
+  // Schedule a couple of fast /state polls so UI doesn't lag one track behind.
+  if (ok) {
+    if (streqLower(cmd, "NEXT") || streqLower(cmd, "PREV") || streqLower(cmd, "PLAYPAUSE") || streqLower(cmd, "PLAY") || streqLower(cmd, "PAUSE")) {
+      unsigned long now = millis();
+      pcForcePollAtMs1 = now + 150UL;
+      pcForcePollAtMs2 = now + 650UL;
+    }
+  }
+  return ok;
+}
+
+void setPcAnalogUi(bool enabled, bool persistPrefs) {
+  if (standbyState || fmRadio.utilMode || fmRadio.sursa != 4) return;
+
+  pcAnalogUi = enabled;
+
+  if (pcAnalogUi) {
+    // Clear the "now playing" region and show a simple analog path label.
+    fmRadio.tft.fillRect(0, 60, SCREEN_WIDTH, 89, ST77XX_BLACK);
+    fmRadio.tft.setTextSize(3);
+    fmRadio.tft.setTextColor(ST77XX_WHITE);
+    const char *msg = "PC analogic";
+    int16_t x1, y1;
+    uint16_t w, h;
+    fmRadio.tft.getTextBounds(msg, 0, 0, &x1, &y1, &w, &h);
+    const int cx = (SCREEN_WIDTH - (int)w) / 2;
+    const int cy = 60 + (89 - (int)h) / 2;
+    fmRadio.tft.setCursor(cx, cy);
+    fmRadio.tft.print(msg);
+  } else {
+    updatePcNowPlayingUi(true);
+  }
+
+  updateRpiTransportPlayIcon(true);
+
+  if (persistPrefs) {
+    fmRadio.saveSettings();
+  }
 }
 
 static inline const char *skipSpaces(const char *p) {
   while (*p == ' ' || *p == '\t') p++;
   return p;
+}
+
+static void normalizePlayerState(char *st, size_t stSize) {
+  (void)stSize;
+  if (!st || !st[0]) return;
+  // Normalize common variants so UI logic is consistent across bridges.
+  if (streqLower(st, "paused")) strcpy(st, "pause");
+  else if (streqLower(st, "stopped")) strcpy(st, "stop");
+  else if (streqLower(st, "playing")) strcpy(st, "play");
 }
 
 static void copyTrim(char *dst, size_t dstSize, const char *start, const char *end) {
@@ -2158,53 +3427,194 @@ static void copyTrim(char *dst, size_t dstSize, const char *start, const char *e
   dst[n] = '\0';
 }
 
-static const char *parseCsv12(const char *p, char endDelim, uint8_t *outVals) {
-  for (int i = 0; i < 12; i++) {
-    p = skipSpaces(p);
-    if (*p == endDelim || *p == '\0') {
-      for (int j = i; j < 12; j++) outVals[j] = 0;
-      return p;
-    }
-    char *endp = nullptr;
-    long v = strtol(p, &endp, 10);
-    if (endp == p) {
-      // Not a number; skip until next delimiter and treat as 0.
-      outVals[i] = 0;
-      while (*p && *p != ',' && *p != endDelim) p++;
-    } else {
-      if (v < 0) v = 0;
-      if (v > 255) v = 255;
-      outVals[i] = (uint8_t)v;
-      p = endp;
-    }
-    p = skipSpaces(p);
-    if (*p == ',') p++;
-    else if (*p == endDelim || *p == '\0') {
-      // OK: end of this CSV section
-    } else {
-      // Unknown separator; advance defensively
-      while (*p && *p != ',' && *p != endDelim) p++;
-      if (*p == ',') p++;
-    }
+void updatePcNowPlayingUi(bool forceRedraw) {
+  if (standbyState || fmRadio.utilMode) return;
+  if (!(fmRadio.sursa == 4 || fmRadio.sursa == 5)) return;
+  if (fmRadio.sursa == 4 && pcAnalogUi) return;
+
+  // Status row (same layout anchors as RPi screen)
+  fmRadio.tft.setTextSize(1);
+  fmRadio.tft.fillRect(0, 77, SCREEN_WIDTH, 10, ST77XX_BLACK);
+  fmRadio.tft.setTextColor(ST77XX_CYAN);
+  fmRadio.tft.setCursor(0, 77);
+  fmRadio.tft.print(fmRadio.sursa == 4 ? "PCA:" : "PCD:");
+  fmRadio.tft.print(pcBridgeOk ? " ONLINE " : " OFFLINE ");
+  fmRadio.tft.print(" ");
+  fmRadio.tft.print(pcStateBuf);
+
+  // File / format line uses full width (below the status row).
+  fmRadio.tft.fillRect(0, 88, SCREEN_WIDTH, 10, ST77XX_BLACK);
+  fmRadio.tft.setTextSize(1);
+  fmRadio.tft.setTextColor(ST77XX_WHITE);
+  fmRadio.tft.setCursor(0, 90);
+  {
+    char fileLine[48];
+    fmtShorten(pcExtraBuf, 40, fileLine, sizeof(fileLine));
+    fmRadio.tft.print(fileLine);
   }
-  return p;
+
+  // Title ticker uses rpiTitleBuf path; mirror foobar title into rpiTitleBuf while on PC source.
+  strncpy(rpiTitleBuf, pcTitleBuf, sizeof(rpiTitleBuf) - 1);
+  rpiTitleBuf[sizeof(rpiTitleBuf) - 1] = '\0';
+  updateRpiTitleTicker(forceRedraw);
+
+  // Artist line (same band as RPi)
+  fmRadio.tft.fillRect(0, 123, SCREEN_WIDTH, 20, ST77XX_BLACK);
+  fmRadio.tft.setTextSize(2);
+  fmRadio.tft.setTextColor(ST77XX_WHITE);
+  fmRadio.tft.setCursor(0, 125);
+  {
+    char artistDisp[40];
+    fmtShorten(pcArtistBuf, 30, artistDisp, sizeof(artistDisp));
+    fmRadio.tft.print(artistDisp);
+  }
+}
+
+void processPcStatLine(const char *line) {
+  if (!line) return;
+  if (strncmp(line, "STAT|", 5) != 0) return;
+
+  const char *p = line + 5;
+  const char *s1 = strchr(p, '|');
+  if (!s1) return;
+  const char *s2 = strchr(s1 + 1, '|');
+  if (!s2) return;
+  const char *s3 = strchr(s2 + 1, '|');
+  if (!s3) return;
+
+  char newState[16], newTitle[96], newArtist[96], newExtra[96];
+  copyTrim(newState, sizeof(newState), p, s1);
+  copyTrim(newTitle, sizeof(newTitle), s1 + 1, s2);
+  copyTrim(newArtist, sizeof(newArtist), s2 + 1, s3);
+  copyTrim(newExtra, sizeof(newExtra), s3 + 1, s3 + 1 + strlen(s3 + 1));
+
+  if (newTitle[0] == '\0') strcpy(newTitle, "-");
+  if (newArtist[0] == '\0') strcpy(newArtist, "-");
+  if (newExtra[0] == '\0') strcpy(newExtra, "-");
+  if (newState[0] == '\0') strcpy(newState, "unknown");
+  normalizePlayerState(newState, sizeof(newState));
+
+  bool changed = (strcmp(newState, pcStateBuf) != 0) || (strcmp(newTitle, pcTitleBuf) != 0) || (strcmp(newArtist, pcArtistBuf) != 0) || (strcmp(newExtra, pcExtraBuf) != 0);
+
+  strncpy(pcStateBuf, newState, sizeof(pcStateBuf) - 1);
+  pcStateBuf[sizeof(pcStateBuf) - 1] = '\0';
+  strncpy(pcTitleBuf, newTitle, sizeof(pcTitleBuf) - 1);
+  pcTitleBuf[sizeof(pcTitleBuf) - 1] = '\0';
+  strncpy(pcArtistBuf, newArtist, sizeof(pcArtistBuf) - 1);
+  pcArtistBuf[sizeof(pcArtistBuf) - 1] = '\0';
+  strncpy(pcExtraBuf, newExtra, sizeof(pcExtraBuf) - 1);
+  pcExtraBuf[sizeof(pcExtraBuf) - 1] = '\0';
+
+  // NOTE: "offline" here refers to Beefweb/player state, not ESP->PC bridge connectivity.
+  // Bridge connectivity is tracked via lastPcHttpCode in pollPcBridge().
+  lastPcRxMs = millis();
+
+  if (changed && !standbyState && !fmRadio.utilMode && (fmRadio.sursa == 4 || fmRadio.sursa == 5 || fmRadio.sursa == 3)) {
+    if (!pcAnalogUi) {
+      updatePcNowPlayingUi(true);
+    }
+    updateRpiTransportPlayIcon(true);
+  }
+}
+
+void pollPcBridge() {
+  // Foobar bridge active on PCA (source 4) and on PCD mode (source 3 + pcdMode).
+  // Do NOT skip while utilMode: same rationale as pcBridgeTask() — otherwise /state never
+  // updates, WebUI sticks on Offline, and transport metadata goes stale until UTIL exits.
+  if (standbyState) return;
+  if (!(fmRadio.sursa == 4 || fmRadio.sursa == 5)) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!PC_BRIDGE_HOST || !PC_BRIDGE_HOST[0]) return;
+
+#if defined(ARDUINO_ARCH_ESP32)
+  // When ENABLE_PC_BRIDGE_POLLING is 1, pcBridgeTask() owns /state polling (non-blocking).
+  // When it is 0, fall through and poll from loop() so WebUI/metadata still update (at cost of occasional HTTP blocking).
+  if (ENABLE_PC_BRIDGE_POLLING) return;
+#endif
+
+  unsigned long now = millis();
+  // When the PC bridge is offline/unreachable, frequent blocking HTTP GETs can starve WiFi/WebUI/audio.
+  // Use a simple backoff to reduce load while offline; keep faster polls when online.
+  static uint8_t pcFailStreak = 0;
+  static unsigned long pcNextPollDueMs = 0;
+  const unsigned long onlinePollMinMs = 900UL;
+  const unsigned long offlinePollMinMs = 6000UL;
+  if ((long)(now - pcNextPollDueMs) < 0) return;
+
+  bool forced = false;
+  if (pcForcePollAtMs1 && (long)(now - pcForcePollAtMs1) >= 0) {
+    forced = true;
+    pcForcePollAtMs1 = 0;
+  } else if (pcForcePollAtMs2 && (long)(now - pcForcePollAtMs2) >= 0) {
+    forced = true;
+    pcForcePollAtMs2 = 0;
+  }
+  // Rate-limit: allow forced polls, otherwise use different cadence based on last known bridge status.
+  const unsigned long minPoll = pcBridgeOk ? onlinePollMinMs : offlinePollMinMs;
+  if (!forced && (now - lastPcPollMs < minPoll)) return;
+  lastPcPollMs = now;
+
+  HTTPClient http;
+  String url;
+  url.reserve(96);
+  url = "http://";
+  url += PC_BRIDGE_HOST;
+  url += ":";
+  url += String(PC_BRIDGE_PORT);
+  url += "/state";
+
+  http.setTimeout(PC_BRIDGE_TIMEOUT_MS);
+  if (!http.begin(url)) {
+    pcBridgeOk = false;
+    lastPcHttpCode = 0;
+    if (pcFailStreak < 20) pcFailStreak++;
+    // Backoff grows up to ~60s while offline.
+    pcNextPollDueMs = now + min(60000UL, (unsigned long)offlinePollMinMs * (unsigned long)pcFailStreak);
+    // Serial spam disabled (PC bridge polling diagnostics).
+    return;
+  }
+
+  uint32_t t0 = millis();
+  int code = http.GET();
+  uint32_t dt = millis() - t0;
+  lastPcHttpCode = code;
+  if (code < 200 || code >= 300) {
+    http.end();
+    pcBridgeOk = false;
+    if (pcFailStreak < 20) pcFailStreak++;
+    pcNextPollDueMs = now + min(60000UL, (unsigned long)offlinePollMinMs * (unsigned long)pcFailStreak);
+    // Serial spam disabled (PC bridge polling diagnostics).
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  body.trim();
+  pcBridgeOk = true;
+  pcFailStreak = 0;
+  pcNextPollDueMs = now + onlinePollMinMs;
+  // Serial spam disabled (PC bridge polling diagnostics).
+  processPcStatLine(body.c_str());
 }
 
 void processRpiLine(const char *line) {
-  if (strncmp(line, "FFT|", 4) == 0) {
-    const char *p = line + 4;
-    p = parseCsv12(p, '|', rpiFftL);
-    if (*p == '|') p++;
-    parseCsv12(p, '\0', rpiFftR);
-    // Mark bridge link alive on FFT frames too; otherwise periodic GET probes can
-    // preempt serial bandwidth and create visible micro-stutter.
-    rpiConnected = true;
-    lastRpiRxMs = millis();
-    lastRpiFftMs = millis();
-    rpiFftDirty = true;
-    return;
-  }
   if (strncmp(line, "STAT|", 5) != 0) return;
+  // While the UI is in PC/foobar mode, the Raspberry UART bridge may still stream STAT lines.
+  // Do not let those updates clobber the RPi metadata buffers (they are reused for PC title ticker).
+  // Only block STAT updates while in PCA/PCD screens (they reuse buffers for foobar UI).
+  if (!standbyState && (fmRadio.sursa == 4 || fmRadio.sursa == 5)) return;
+  // #region agent log: H2 STAT redraw spikes
+  profStatCount++;
+  // #endregion
+  // #region agent log: H5 measure full STAT handling + heap jitter
+  uint32_t statT0 = micros();
+  #if defined(ARDUINO_ARCH_ESP32)
+  profHeapNow = ESP.getFreeHeap();
+  uint32_t mh = ESP.getMinFreeHeap();
+  if (mh < profHeapMin) profHeapMin = mh;
+  #endif
+  // #endregion
   const char *p = line + 5;
   const char *s1 = strchr(p, '|'); if (!s1) return;
   const char *s2 = strchr(s1 + 1, '|'); if (!s2) return;
@@ -2219,41 +3629,63 @@ void processRpiLine(const char *line) {
   if (newTitleBuf[0] == '\0') strcpy(newTitleBuf, "-");
   if (newArtistBuf[0] == '\0') strcpy(newArtistBuf, "-");
   if (newFileBuf[0] == '\0') strcpy(newFileBuf, "-");
+  if (newStateBuf[0] == '\0') strcpy(newStateBuf, "unknown");
+  normalizePlayerState(newStateBuf, sizeof(newStateBuf));
 
-  String newState = String(newStateBuf);
-  String newTitle = String(newTitleBuf);
-  String newArtist = String(newArtistBuf);
-  String newFile = String(newFileBuf);
-
-  bool stateChanged = (newState != rpiState);
-  bool titleChanged = (newTitle != rpiTitle);
-  bool artistChanged = (newArtist != rpiArtist);
-  bool fileChanged = (newFile != rpiFile);
+  bool stateChanged = (strcmp(newStateBuf, rpiStateBuf) != 0);
+  bool titleChanged = (strcmp(newTitleBuf, rpiTitleBuf) != 0);
+  bool artistChanged = (strcmp(newArtistBuf, rpiArtistBuf) != 0);
+  bool fileChanged = (strcmp(newFileBuf, rpiFileBuf) != 0);
   bool majorChanged = stateChanged || titleChanged || artistChanged;
-  rpiState = newState;
-  rpiTitle = newTitle;
-  rpiArtist = newArtist;
-  rpiFile = newFile;
+  strncpy(rpiStateBuf, newStateBuf, sizeof(rpiStateBuf) - 1);
+  rpiStateBuf[sizeof(rpiStateBuf) - 1] = '\0';
+  strncpy(rpiTitleBuf, newTitleBuf, sizeof(rpiTitleBuf) - 1);
+  rpiTitleBuf[sizeof(rpiTitleBuf) - 1] = '\0';
+  strncpy(rpiArtistBuf, newArtistBuf, sizeof(rpiArtistBuf) - 1);
+  rpiArtistBuf[sizeof(rpiArtistBuf) - 1] = '\0';
+  strncpy(rpiFileBuf, newFileBuf, sizeof(rpiFileBuf) - 1);
+  rpiFileBuf[sizeof(rpiFileBuf) - 1] = '\0';
   rpiConnected = true;
   lastRpiRxMs = millis();
 
-  if (!fmRadio.utilMode && fmRadio.sursa == 3) {
-    if (majorChanged) {
+  // Live UI refresh on RPi screen (throttled) so Prev/Next updates metadata quickly.
+  static unsigned long lastUiUpdateMs = 0;
+  if (!standbyState && !fmRadio.utilMode && (fmRadio.sursa == 3 && !pcdMode) && (majorChanged || fileChanged)) {
+    unsigned long now = millis();
+    if (now - lastUiUpdateMs >= 280UL) {
       fmRadio.updateMainContent();
-    } else if (fileChanged) {
-      // Avoid full-layout redraw for format-only changes; update just the right status segment.
-      fmRadio.tft.setTextSize(1);
-      fmRadio.tft.fillRect(147, 74, 88, 10, ST77XX_BLACK);
-      fmRadio.tft.setTextColor(ST77XX_WHITE);
-      fmRadio.tft.setCursor(147, 77);
-      fmRadio.tft.print(shortenText(rpiFile, 14));
-      fmRadio.tft.setTextColor(ST77XX_CYAN);
+      updateRpiTransportPlayIcon(true);
+      updateRpiPlayIndicator(true);
+      lastUiUpdateMs = now;
     }
   }
+  // #region agent log: H5 measure full STAT handling + heap jitter
+  uint32_t statDt = micros() - statT0;
+  if (statDt > profStatUsMax) profStatUsMax = statDt;
+  // #endregion
 }
 
 void pollRpiSerial() {
-  while (Serial2.available()) {
+  if (!rpiUartEnabled) return;
+  // Decouple non-RPi sources from the Raspberry bridge state/startup.
+  // Outside standby/RPi context we only drain a tiny amount of UART RX and skip GET polling/command retries.
+  if (!isRpiContextActive()) {
+    for (int iter = 0; iter < 16 && Serial2.available(); iter++) {
+      char c = (char)Serial2.read();
+      if (c == '\n') rpiRxLen = 0;
+      else if (c != '\r' && rpiRxLen < (sizeof(rpiRxLine) - 1)) rpiRxLine[rpiRxLen++] = c;
+    }
+    if (rpiConnected && (millis() - lastRpiRxMs >= 5000UL)) {
+      rpiConnected = false;
+    }
+    return;
+  }
+  // #region agent log: H3 measure pollRpiSerial spikes
+  uint32_t t0 = micros();
+  // #endregion
+  // Don't spend unbounded time draining a large UART burst in one loop() tick.
+  for (int iter = 0; iter < 48 && Serial2.available(); iter++) {
+    if ((iter & 15) == 15) yield();
     char c = (char)Serial2.read();
     if (c == '\r') continue;
     if (c == '\n') {
@@ -2268,23 +3700,38 @@ void pollRpiSerial() {
   }
 
   unsigned long now = millis();
+  if (rpiForceGetAtMs && (long)(now - rpiForceGetAtMs) >= 0) {
+    if (serial2TryPrint("GET\n")) {
+      lastRpiPollMs = now;
+      rpiForceGetAtMs = 0;
+    } else {
+      rpiForceGetAtMs = now + 150UL;
+    }
+  }
   // If link is online keep quick refresh; if offline back off retries to reduce UART churn.
   const unsigned long onlinePollMs = 3000UL;
-  const unsigned long offlinePollMs = 12000UL;
+  const unsigned long offlinePollMs = 30000UL;
   const unsigned long pollIntervalMs = rpiConnected ? onlinePollMs : offlinePollMs;
+  const unsigned long minSilenceMs = rpiConnected ? 1800UL : 8000UL;
   // Bridge already pushes STAT periodically; request GET only when updates look stale.
-  if (!standbyState && fmRadio.sursa == 3
+  // În standby cerem tot GET ca să vedem dacă Moode e în play (indicator pe ecran).
+  if ((standbyState || (!standbyState && fmRadio.sursa == 3 && !pcdMode))
       && (now - lastRpiPollMs >= pollIntervalMs)
-      && (now - lastRpiRxMs >= 1800UL)) {
-    Serial2.print("GET\n");
-    lastRpiPollMs = now;
+      && (now - lastRpiRxMs >= minSilenceMs)) {
+    if (serial2TryPrint("GET\n")) {
+      lastRpiPollMs = now;
+    }
   }
   if (rpiConnected && (now - lastRpiRxMs >= 5000UL)) {
     rpiConnected = false;
-    if (!fmRadio.utilMode && fmRadio.sursa == 3) {
+    if (!standbyState && !fmRadio.utilMode && fmRadio.sursa == 3) {
       fmRadio.updateMainContent();
     }
   }
+  // #region agent log: H3 measure pollRpiSerial spikes
+  uint32_t dt = micros() - t0;
+  if (dt > profPollUsMax) profPollUsMax = dt;
+  // #endregion
 }
 
 //------------------------------------
@@ -2328,20 +3775,52 @@ void initMcp() {
 // Setup & Loop
 //------------------------------------
 void setup() {
+  // IMPORTANT: Keep the DAC visible to Raspberry at boot.
+  // If the I2S mux is left on Amanero during Pi boot, the ES9038 HAT may fail to probe
+  // (no ALSA card => Moode "Output device" disappears) and won't recover until reboot.
+  if (PC_DIGITAL_STATUS_PIN >= 0) {
+    pinMode(PC_DIGITAL_STATUS_PIN, OUTPUT);
+    // Default to Raspberry (non-PCD) until we load settings and apply the real source.
+    const bool wantAmanero = false;
+    const bool level = PC_DIGITAL_STATUS_AMANERO_LEVEL_HIGH ? wantAmanero : !wantAmanero;
+    digitalWrite(PC_DIGITAL_STATUS_PIN, level ? HIGH : LOW);
+  }
+
   Serial.begin(115200);
-  delay(1000);
-  initRpiSerial();
+  delay(250);
+  // Reset diagnostics (helps explain repeated "Starting setup..." loops)
+#if defined(ARDUINO_ARCH_ESP32)
+  Serial.print("[BOOT] resetReason: ");
+  Serial.println((int)esp_reset_reason());
+  Serial.print("[BOOT] heap=");
+  Serial.println(ESP.getFreeHeap());
+#endif
+  // Boot-time TDA volume log (10s cadence for 5 minutes).
+#if BOOT_TDA_VOLUME_LOG
+  bootTdaLogActive = true;
+  bootTdaLogNextMs = millis() + 10000UL;
+  bootTdaLogUntilMs = millis() + 300000UL;
+#endif
+  // RPi UART is enabled only when source=RPI/standby; keep it off during boot to avoid RX noise flooding.
+  setRpiUartEnabled(false);
+  rpiBridgeArmed = false;
+  lastSourceSeen = fmRadio.sursa;
 
   Serial.println("Starting setup...");
 
-  // Ensure power rails (relay) are ON before any I2C/touch/display init
+  // GPIO33: indicator / alimentare logică — HIGH la pornire; nu se comută la standby
   pinMode(POWER_INDICATOR_PIN, OUTPUT);
-  digitalWrite(POWER_INDICATOR_PIN, HIGH);  // GPIO33 = 1 when ESP32 powered
-  pinMode(STANDBY_OUT_PIN, OUTPUT);
-  digitalWrite(STANDBY_OUT_PIN, HIGH);  // Active mode = power ON
+  digitalWrite(POWER_INDICATOR_PIN, HIGH);
   pinMode(RADIO_LED_PIN, OUTPUT);
   digitalWrite(RADIO_LED_PIN, LOW);    // Will be set in loop when FM is active
-  Serial.println("Standby pin set HIGH (power ON)");
+
+  if (PC_AUDIO_SEL_PIN >= 0) {
+    pinMode(PC_AUDIO_SEL_PIN, OUTPUT);
+    // Default to PCA (XMOS) on boot.
+    const bool level = PC_AUDIO_SEL_ACTIVE_HIGH ? false : true;
+    digitalWrite(PC_AUDIO_SEL_PIN, level ? HIGH : LOW);
+  }
+  // PC_DIGITAL_STATUS_PIN was already initialized at the top of setup() to keep DAC probe stable.
 
   // Initialize I2C with explicit pins
   Serial.println("Initializing I2C...");
@@ -2397,6 +3876,26 @@ void setup() {
 
   connectToWiFi();
 
+#if defined(ARDUINO_ARCH_ESP32)
+  // Run scheduled (hourly) NTP sync in the background to avoid UI freezes.
+  // Manual sync from the touchscreen button intentionally remains blocking.
+  if (ntpSyncTaskHandle == nullptr) {
+    // Pin NTP sync away from the web server task (which runs on core 0) to reduce chances
+    // of WiFi/SNTP work starving HTTP handling during early boot.
+    xTaskCreatePinnedToCore(ntpSyncTask, "ntpSyncTask", 4096, nullptr, 1, &ntpSyncTaskHandle, 1);
+  }
+  // PC bridge polling task (keeps blocking HTTP out of loop()).
+  if (ENABLE_PC_BRIDGE_POLLING && pcBridgeTaskHandle == nullptr) {
+    // Pin PC bridge polling to the same core as the web/WiFi work (core 0) to avoid
+    // intermittent/permanent connect failures seen when running WiFiClient from core 1.
+    xTaskCreatePinnedToCore(pcBridgeTask, "pcBridgeTask", 4096, nullptr, 1, &pcBridgeTaskHandle, 0);
+  }
+#endif
+
+  // First scheduled cycle: delay after boot to avoid WiFi/SNTP churn while Web UI is starting up.
+  // (User reported a ~10–15s post-boot freeze window.)
+  nextNtpSyncDueMs = millis() + 180000UL; // 3 minutes
+
   // --- OTA SETUP ---
   ArduinoOTA.setHostname("flo-amp");
   ArduinoOTA.setPassword("quickprint");
@@ -2425,11 +3924,24 @@ void setup() {
   ArduinoOTA.begin();
   Serial.println("OTA Ready");
 
-  // Standby pin already initialized at start; keep rails ON after OTA init
-  digitalWrite(STANDBY_OUT_PIN, HIGH);
+  Serial.print("[BUILD] PC_ONLY_FOOBAR=");
+  Serial.println((int)PC_ONLY_FOOBAR);
 
   Serial.println("fmRadio.loadSettings()");
   fmRadio.loadSettings();
+  // Restored sursa from NVS must arm the RPi UART bridge; otherwise rpiBridgeArmed stays false from boot
+  // and RPI shows offline / never receives STAT until user presses the physical RPI button or POST /source.
+  if (fmRadio.sursa == 3) {
+    rpiBridgeArmed = true;
+    Serial.println("[RPI] Bridge armed from saved source=RPI");
+    // Bring UART up immediately so we can receive STAT without requiring another UI action.
+#if !PC_ONLY_FOOBAR
+    setRpiUartEnabled(true);
+    rpiForceGetAtMs = millis() + 220UL;
+#endif
+  }
+
+  // No PC audio routing mux.
 
   // Ensure SI4703 is in 2‑wire (I2C) mode and bus is healthy, then detect
   i2cBusRecover();
@@ -2464,6 +3976,7 @@ void setup() {
     fmRadio.radio.setVolume(fmRadio.currentVolume);
   }
   tda7439.setVolume(fmRadio.currentVolume);
+  noteTdaWrite("boot", -1, fmRadio.currentVolume);
   delay(5);
   setEncoderCount(fmRadio.currentVolume);
   encoderLastEncVal = fmRadio.currentVolume;
@@ -2475,22 +3988,51 @@ void setup() {
   fmRadio.wasSetup = false;
 
   // --- Web server setup ---
+#if ENABLE_WEBUI
   server.on("/", handleRoot);
-  server.on("/power", HTTP_POST, handlePower);
-  server.on("/powerState", HTTP_GET, handlePowerState);
-  server.on("/mute", handleMute);
-  server.on("/muteState", HTTP_GET, handleMute);
-  server.on("/volume", handleVolume);
-  server.on("/source", handleSource);
-  server.on("/freq", handleFreq);
-  server.on("/eq", handleEQ);
-  server.on("/seek", HTTP_POST, handleSeek);
-  server.on("/rpi", HTTP_POST, handleRpi);
-  server.on("/status", HTTP_GET, handleStatus);
+  // v2 API
+  server.on("/api/v2/state", HTTP_GET, handleApiV2State);
+  server.on("/api/v2/power", HTTP_POST, handleApiV2Power);
+  server.on("/api/v2/mute", HTTP_POST, handleApiV2Mute);
+  server.on("/api/v2/volume", HTTP_POST, handleApiV2Volume);
+  server.on("/api/v2/source", HTTP_POST, handleApiV2Source);
+  server.on("/api/v2/eq", HTTP_POST, handleApiV2Eq);
+  server.on("/api/v2/pc/test", HTTP_GET, handleApiV2PcTest);
+  server.on("/api/v2/tuner/seek", HTTP_POST, handleApiV2TunerSeek);
+  server.on("/api/v2/rpi/cmd", HTTP_POST, handleApiV2RpiCmd);
+  server.on("/api/v2/pc/cmd", HTTP_POST, handleApiV2PcCmd);
+  // Back-compat for Standby page and older bookmarks
   server.on("/systemInfo", HTTP_GET, handleSystemInfo);
-  server.on("/presets", handlePresets);
+  // v2 WebUI still uses a few legacy read/write endpoints for tuner presets.
+  server.on("/presets", HTTP_GET, handlePresets);
   server.on("/preset", handlePreset);
+  server.on("/freq", handleFreq);
+  /*
+   * === WEBUI_V1_BEGIN ===
+   * Legacy endpoints (kept for reference; disabled):
+   *   server.on(\"/power\", HTTP_POST, handlePower);
+   *   server.on(\"/mute\", handleMute);
+   *   server.on(\"/volume\", handleVolume);
+   *   server.on(\"/source\", handleSource);
+   *   server.on(\"/freq\", handleFreq);
+   *   server.on(\"/eq\", handleEQ);
+   *   server.on(\"/seek\", HTTP_POST, handleSeek);
+   *   server.on(\"/rpi\", HTTP_POST, handleRpi);
+   *   server.on(\"/pc\", HTTP_POST, handlePc);
+   *   server.on(\"/status\", HTTP_GET, handleStatus);
+   *   server.on(\"/systemInfo\", HTTP_GET, handleSystemInfo);
+   *   server.on(\"/presets\", handlePresets);
+   *   server.on(\"/preset\", handlePreset);
+   * === WEBUI_V1_END ===
+   */
   server.begin();
+#endif
+#if defined(ARDUINO_ARCH_ESP32) && ENABLE_WEBUI
+  // Start accepting TCP immediately; do not wait for mDNS / I2C cache below (was adding 0.2–1.2s dead air).
+  if (webServerTaskHandle == nullptr) {
+    xTaskCreatePinnedToCore(webServerTask, "webServerTask", 16384, nullptr, 2, &webServerTaskHandle, 0);
+  }
+#endif
   // Initializare cache system info (I2C o singura data in setup)
   Wire.beginTransmission(0x44);
   cachedTdaOk = (Wire.endTransmission() == 0);
@@ -2503,9 +4045,9 @@ void setup() {
 
   // mDNS pentru http://flo-amp.local (daca nu merge, foloseste IP-ul afisat mai jos)
   if (WiFi.status() == WL_CONNECTED) {
-    delay(200);
+    delay(80);
     if (!MDNS.begin("flo-amp")) {
-      delay(1000);
+      delay(400);
       if (!MDNS.begin("flo-amp")) {
         Serial.println("mDNS esuat - deschide Web UI cu IP-ul de mai jos");
       } else {
@@ -2522,11 +4064,6 @@ void setup() {
     Serial.println("----------------------------------------");
   }
 
-#if defined(ARDUINO_ARCH_ESP32)
-  // Run HTTP/OTA handling on core 0 to keep UI loop responsive
-  xTaskCreatePinnedToCore(webServerTask, "webServerTask", 12288, nullptr, 2, &webServerTaskHandle, 0);
-#endif
-
   // Set up IR receiver on pin 12
   IrReceiver.begin(12, ENABLE_LED_FEEDBACK); // Use pin 12 for IR
 
@@ -2541,38 +4078,402 @@ void setup() {
   testTDA7439Comms();
 }
 
-void loop() {
-  static int lastSourceSeen = -1;
-  mainLoopCounter++;
-  // HTTP/OTA handled in a separate task (ESP32)
-#if !defined(ARDUINO_ARCH_ESP32)
-  ArduinoOTA.handle();
-  server.handleClient();
+static void tickSourceTransitionsAndBridgeIo() {
+  const int prevSource = lastSourceSeen;
+#if PC_ONLY_FOOBAR
+  setRpiUartEnabled(false);
+  rpiBridgeArmed = false;
+  const bool rpiContextActive = false;
+#else
+  const bool rpiContextActive = isRpiContextActive();
+  setRpiUartEnabled(rpiContextActive);
 #endif
 
-  // Force an immediate RPi state read when entering RPI source (or at boot on RPI source).
-  if (!standbyState && fmRadio.sursa == 3 && lastSourceSeen != 3) {
-    sendRpiCommand("GET");
-    lastRpiPollMs = millis();
+  // Entering RPi source: force an immediate state read (unless in PCD mode).
+#if !PC_ONLY_FOOBAR
+  if (!standbyState && fmRadio.sursa == 3 && !pcdMode && prevSource != 3) {
+    unsigned long t = millis();
+    if (serial2TryPrint("GET\n")) {
+      lastRpiPollMs = t;
+    } else {
+      rpiForceGetAtMs = t + 120UL;
+    }
   }
+#endif
+
+  // Entering PCA/PCD mode: pause Moode so foobar can take over.
+  if (!standbyState && (fmRadio.sursa == 4 || fmRadio.sursa == 5) && (prevSource != 4 && prevSource != 5)) {
+    // Keep non-RPi sources independent: only attempt PAUSE when bridge is already alive.
+#if !PC_ONLY_FOOBAR
+    if (rpiConnected) sendRpiCommand("PAUSE");
+#endif
+  }
+
+  // Leaving PCA/PCD mode: rpiTitleBuf may have been reused as a scratch buffer for the title ticker.
+  if (!standbyState && (prevSource == 4 || prevSource == 5) && (fmRadio.sursa != 4 && fmRadio.sursa != 5)) {
+    strcpy(rpiTitleBuf, "-");
+    pcAnalogUi = false;
+  }
+
   lastSourceSeen = fmRadio.sursa;
 
-  pollRpiSerial();
-  if (!standbyState && fmRadio.sursa == 3) {
-    // Keep FFT drawing first to reduce occasional UI micro-freeze.
-    if (rpiFftDirty && (millis() - lastRpiBarDrawMs >= 35UL)) {
-      drawRpiBargraph(false);
-      lastRpiBarDrawMs = millis();
-      rpiFftDirty = false;
+  if (rpiContextActive) {
+    unsigned long nowm = millis();
+    if (rpiWebCmdNextTryMs != 0UL && (long)(nowm - rpiWebCmdNextTryMs) >= 0) {
+      rpiWebCmdNextTryMs = 0;
     }
-    if (lastRpiFftMs > 0 && (millis() - lastRpiFftMs > 1500UL)) {
-      for (int i = 0; i < 12; i++) {
-        rpiFftL[i] = 0;
-        rpiFftR[i] = 0;
+    if (rpiWebCmdNextTryMs == 0UL) {
+      char rpiCmdLocal[sizeof(rpiWebCmdBuf)];
+      bool haveRpiWeb =
+#if defined(ARDUINO_ARCH_ESP32)
+          popPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal, sizeof(rpiCmdLocal), &rpiWebCmdMux);
+#else
+          popPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal, sizeof(rpiCmdLocal));
+#endif
+      if (haveRpiWeb && !sendRpiCommand(rpiCmdLocal)) {
+        rpiWebCmdNextTryMs = nowm + 55UL;
+#if defined(ARDUINO_ARCH_ESP32)
+        setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal, &rpiWebCmdMux);
+#else
+        setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal);
+#endif
       }
-      lastRpiFftMs = millis();
-      rpiFftDirty = true;
     }
+  } else {
+    // Outside standby/RPi context, keep UART command retries disabled.
+    rpiWebCmdNextTryMs = 0;
+    rpiForceGetAtMs = 0;
+  }
+
+#if !PC_ONLY_FOOBAR
+  pollRpiSerial();
+#endif
+  // PC bridge: either a background task feeds STAT lines, or we poll from the main loop here.
+#if defined(ARDUINO_ARCH_ESP32)
+  if (ENABLE_PC_BRIDGE_POLLING) {
+    char line[220];
+    if (pcPopPendingStatLine(line, sizeof(line))) {
+      processPcStatLine(line);
+    }
+  } else {
+    pollPcBridge();
+  }
+#else
+  pollPcBridge();
+#endif
+
+  {
+    const unsigned long now = millis();
+    if ((long)(now - webStatusWifiRssiAtMs) >= 0) {
+      webStatusWifiRssiAtMs = now + 1000UL;
+      webStatusWifiRssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
+    }
+  }
+
+  {
+    char cmdLocal[sizeof(pcWebCmdBuf)];
+    bool havePcCmd =
+#if defined(ARDUINO_ARCH_ESP32)
+        popPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmdLocal, sizeof(cmdLocal), &pcWebCmdMux);
+#else
+        popPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmdLocal, sizeof(cmdLocal));
+#endif
+    if (havePcCmd) sendPcCommand(cmdLocal);
+  }
+
+#if !PC_ONLY_FOOBAR
+  updateRpiTitleTicker(false);
+  updateRpiTransportPlayIcon(false);
+  updateRpiPlayIndicator(false);
+#endif
+  // Coalesce frequent UI-originated preference writes.
+  fmRadio.flushSettingsIfDue(false);
+}
+
+static void tickPeriodicSchedulers() {
+  // #region agent log: H1/H2/H3 periodic freeze profiler summary (~2s cadence)
+  if (profWindowStartMs == 0) profWindowStartMs = millis();
+  unsigned long nowMs = millis();
+  if (!standbyState && fmRadio.sursa == 3 && (nowMs - profWindowStartMs) >= 2000UL) {
+    uint32_t p0 = micros();
+    if (Serial.availableForWrite() >= 256) {
+      profProfSent++;
+      static uint32_t profNdjsonSeq = 0;
+      profNdjsonSeq++;
+      if (Serial.availableForWrite() >= 512) {
+        uint32_t tsMs = (uint32_t)millis();
+#if defined(ARDUINO_ARCH_ESP32)
+        uint32_t heapNow = ESP.getFreeHeap();
+#else
+        uint32_t heapNow = 0;
+#endif
+        (void)tsMs;
+        (void)heapNow;
+      }
+    } else {
+      profProfSkipped++;
+    }
+    uint32_t pdt = micros() - p0;
+    if (pdt > profPrintUsMax) profPrintUsMax = pdt;
+    if (Serial.availableForWrite() >= 64) {
+      (void)pdt;
+    }
+    profWindowStartMs = nowMs;
+    profDrawUsMax = 0;
+    profMainContentUsMax = 0;
+    profLoopUsMax = 0;
+    profPollUsMax = 0;
+    profSysInfoRuns = 0;
+    profNvsWrites = 0;
+    profFmUpdateUsMax = 0;
+    profTouchUsMax = 0;
+    profShowTimeUsMax = 0;
+    profStatMiniUsMax = 0;
+    profStatUsMax = 0;
+    profTickerUsMax = 0;
+    profTickerDraws = 0;
+    profPrintUsMax = 0;
+    profProfSent = 0;
+    profProfSkipped = 0;
+    profApplyTdaUsMax = 0;
+    profStatCount = 0;
+  }
+  // #endregion
+
+  // Actualizare cache system info la 5 s (I2C doar in main loop, nu in handler web)
+  if (millis() - lastSystemInfoCacheMs >= 5000) {
+    profSysInfoRuns++;
+    lastSystemInfoCacheMs = millis();
+    Wire.beginTransmission(0x44);
+    cachedTdaOk = (Wire.endTransmission() == 0);
+    Wire.beginTransmission(0x68);
+    cachedRtcOk = (Wire.endTransmission() == 0);
+    cachedMcpOk = (mcpI2cAddr != 0) || mcpOk;
+    Wire.beginTransmission(SI4703_ADDR);
+    cachedSi47Ok = (Wire.endTransmission() == 0);
+  }
+
+  // Re-sync RTC from NTP every hour starting from boot.
+  if ((long)(millis() - nextNtpSyncDueMs) >= 0) {
+#if defined(ARDUINO_ARCH_ESP32)
+    if (!ntpSyncInProgress && !ntpSyncRequested && ntpSyncTaskHandle != nullptr) {
+      ntpSyncRequested = true;
+      xTaskNotifyGive(ntpSyncTaskHandle);
+    }
+#else
+    syncRTCWithNTPRetries();
+#endif
+    nextNtpSyncDueMs += NTP_SYNC_INTERVAL_MS;
+    if ((long)(millis() - nextNtpSyncDueMs) >= 0) {
+      nextNtpSyncDueMs = millis() + NTP_SYNC_INTERVAL_MS;
+    }
+  }
+}
+
+static void tickDeferredAppliesAndActions() {
+  if (postBootAudioApplyPending && millis() >= postBootAudioApplyAt && !standbyState) {
+    applyTDA7439SettingsForCurrentSource();
+    postBootAudioApplyPending = false;
+  }
+
+  if (audioApplyPending && millis() >= audioApplyAt && !standbyState) {
+    // NVS read belongs in main loop, not in the HTTP handler (was stretching /api/v2/source timeline).
+    fmRadio.loadEqualizer();
+    applyTDA7439SettingsForCurrentSource();
+    audioApplyPending = false;
+  }
+
+  if (powerOnPending) {
+    powerOnPending = false;
+    exitStandby();
+  } else if (powerOffPending) {
+    powerOffPending = false;
+    enterStandby();
+  }
+
+  if (buttonPressed(STANDBY_CTRL_PIN, lastStandbyState, lastStandbyPressTime)) {
+    standbyState = !standbyState;
+    if (standbyState) enterStandby();
+    else exitStandby();
+  }
+
+  digitalWrite(RADIO_LED_PIN, (!standbyState && fmRadio.sursa == 1) ? HIGH : LOW);
+
+  if (freqApplyPending && !standbyState && fmRadio.sursa == 1) {
+    if (!si4703Powered) {
+      freqApplyPending = false;
+    } else {
+      float f = pendingFreq;
+      fmRadio.currentFrequency = f;
+      fmRadio.radio.setFrequency(f * 100);
+      if (!fmRadio.isInVolumeMode) {
+        setEncoderCount(f * 10);
+      } else {
+        setEncoderCount(fmRadio.currentVolume);
+      }
+      fmRadio.oldFrequency = f;
+      fmRadio.lastFrequencyChangeTime = millis();
+      fmRadio.updateMainContent();
+      fmRadio.saveSettings();
+      delay(1);
+      float actualFreq = fmRadio.radio.getFrequency() / 100.0;
+      if (abs(actualFreq - f) > 0.1) {
+        fmRadio.radio.setFrequency(f * 100);
+        delay(1);
+      }
+      freqApplyPending = false;
+    }
+  }
+
+  if (volumeApplyPending && !standbyState) {
+    int v = pendingVolume;
+    const int applied = fmRadio.isMuted ? 0 : v;
+    tda7439.setVolume(applied);
+    noteTdaWrite("vol", -1, applied);
+    setEncoderCount(v);
+    encoderLastEncVal = v;
+    fmRadio.updateVolumeDisplay();
+    fmRadio.saveSettings();
+    volumeApplyPending = false;
+  }
+
+  if (eqApplyPending && !standbyState) {
+    int tdaGain = (Gain + 45) / 3; // 0..15
+    tda7439.inputGain(tdaGain);
+    delay(1);
+    tda7439.setSnd(Bass, 1);
+    delay(1);
+    tda7439.setSnd(Middle, 2);
+    delay(1);
+    tda7439.setSnd(Treble, 3);
+    delay(1);
+    setTDA7439Balance((int8_t)Balance);
+    delay(1);
+    // EQ from Web UI uses debounced saveSettings(); force NVS write now so Gain/EQ survive reboot.
+    fmRadio.saveSettings();
+    fmRadio.flushSettingsIfDue(true);
+    eqApplyPending = false;
+  }
+
+  if (pendingSeekDir != 0 && !standbyState && fmRadio.sursa == 1) {
+    if (pendingSeekDir > 0) fmRadio.seekUp();
+    else fmRadio.seekDown();
+    pendingSeekDir = 0;
+  }
+
+  if (uiRefreshPending) {
+    if (fmRadio.utilMode) {
+      drawUtilSourceUnderline(fmRadio.sursa);
+      fmRadio.updateUtilSursaChange();
+    } else {
+      fmRadio.updateSelectedSourceDisplay();
+      fmRadio.updateMainContent();
+    }
+    uiRefreshPending = false;
+  }
+
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == 'r') {
+      delay(500);
+      ESP.restart();
+    } else if (c == 't') {
+      testTDA7439Comms();
+    }
+  }
+}
+
+void loop() {
+  // #region agent log: H3 measure full loop spikes
+  uint32_t loopT0 = micros();
+  // #endregion
+  mainLoopCounter++;
+
+#if defined(ARDUINO_ARCH_ESP32)
+  // Update UI state snapshot for background tasks.
+  pcUiSource = fmRadio.sursa;
+  pcUiUtilMode = fmRadio.utilMode;
+#endif
+  // HTTP/OTA handled in a separate task (ESP32)
+#if !defined(ARDUINO_ARCH_ESP32)
+  #if ENABLE_WEBUI
+  ArduinoOTA.handle();
+  server.handleClient();
+  #endif
+#endif
+
+  maintainWiFiConnection();
+
+  tickBootTdaVolumeLog(fmRadio.currentVolume, fmRadio.isMuted);
+
+  tickSourceTransitionsAndBridgeIo();
+  tickPeriodicSchedulers();
+  tickDeferredAppliesAndActions();
+
+#if 0
+    const int prevSource = lastSourceSeen;
+
+  // Entering RPi source: force an immediate state read (unless in PCD mode).
+  if (!standbyState && fmRadio.sursa == 3 && !pcdMode && prevSource != 3) {
+    // Use plain GET (not CMD|GET) to bypass TX flood guards and get immediate metadata.
+    unsigned long t = millis();
+    if (serial2TryPrint("GET\n")) {
+      lastRpiPollMs = t;
+    } else {
+      rpiForceGetAtMs = t + 120UL;
+    }
+  }
+
+  // Entering PCA/PCD mode: pause Moode so foobar can take over.
+  if (!standbyState && (fmRadio.sursa == 4 || fmRadio.sursa == 5) && (prevSource != 4 && prevSource != 5)) {
+    sendRpiCommand("PAUSE");
+  }
+
+  // Leaving PCA/PCD mode: rpiTitleBuf may have been reused as a scratch buffer for the title ticker.
+  if (!standbyState && (prevSource == 4 || prevSource == 5) && (fmRadio.sursa != 4 && fmRadio.sursa != 5)) {
+    strcpy(rpiTitleBuf, "-");
+    pcAnalogUi = false;
+  }
+
+  lastSourceSeen = fmRadio.sursa;
+
+  {
+    unsigned long nowm = millis();
+    if (rpiWebCmdNextTryMs != 0UL && (long)(nowm - rpiWebCmdNextTryMs) < 0) {
+      // UART TX was full; backoff before retrying same command (prevents 100% CPU spin).
+    } else {
+      rpiWebCmdNextTryMs = 0;
+      char rpiCmdLocal[sizeof(rpiWebCmdBuf)];
+      bool haveRpiWeb =
+#if defined(ARDUINO_ARCH_ESP32)
+          popPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal, sizeof(rpiCmdLocal), &rpiWebCmdMux);
+#else
+          popPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal, sizeof(rpiCmdLocal));
+#endif
+      if (haveRpiWeb) {
+        if (!sendRpiCommand(rpiCmdLocal)) {
+          rpiWebCmdNextTryMs = nowm + 55UL;
+#if defined(ARDUINO_ARCH_ESP32)
+          setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal, &rpiWebCmdMux);
+#else
+          setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), rpiCmdLocal);
+#endif
+        }
+      }
+    }
+  }
+
+  pollRpiSerial();
+  pollPcBridge();
+  {
+    char cmdLocal[sizeof(pcWebCmdBuf)];
+    bool havePcCmd =
+#if defined(ARDUINO_ARCH_ESP32)
+        popPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmdLocal, sizeof(cmdLocal), &pcWebCmdMux);
+#else
+        popPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmdLocal, sizeof(cmdLocal));
+#endif
+    if (havePcCmd) sendPcCommand(cmdLocal);
   }
   updateRpiTitleTicker(false);
   updateRpiTransportPlayIcon(false);
@@ -2581,8 +4482,113 @@ void loop() {
   // Coalesce frequent UI-originated preference writes.
   fmRadio.flushSettingsIfDue(false);
 
+  // #region agent log: H1/H2/H3 periodic freeze profiler summary (~2s cadence)
+  if (profWindowStartMs == 0) profWindowStartMs = millis();
+  unsigned long nowMs = millis();
+  if (!standbyState && fmRadio.sursa == 3 && (nowMs - profWindowStartMs) >= 2000UL) {
+    // #region agent log: H8 measure Serial.printf blocking
+    uint32_t p0 = micros();
+    // #endregion
+    if (Serial.availableForWrite() >= 256) {
+      profProfSent++;
+      // Serial.printf("[PROF] win=%lums stat=%lu drawUsMax=%lu mainUsMax=%lu\n",
+      //               (unsigned long)(nowMs - profWindowStartMs),
+      //               (unsigned long)profStatCount,
+      //               (unsigned long)profDrawUsMax,
+      //               (unsigned long)profMainContentUsMax);
+      // Serial.printf("[PROF2] loopUsMax=%lu pollUsMax=%lu sysInfo=%u nvsWrites=%u\n",
+      //               (unsigned long)profLoopUsMax,
+      //               (unsigned long)profPollUsMax,
+      //               (unsigned)profSysInfoRuns,
+      //               (unsigned)profNvsWrites);
+      // Serial.printf("[PROF3] fmUpdUsMax=%lu touchUsMax=%lu timeUsMax=%lu statMiniUsMax=%lu\n",
+      //               (unsigned long)profFmUpdateUsMax,
+      //               (unsigned long)profTouchUsMax,
+      //               (unsigned long)profShowTimeUsMax,
+      //               (unsigned long)profStatMiniUsMax);
+      // Serial.printf("[PROF4] statUsMax=%lu tickerUsMax=%lu tickerDraws=%u heapNow=%lu heapMin=%lu\n",
+      //               (unsigned long)profStatUsMax,
+      //               (unsigned long)profTickerUsMax,
+      //               (unsigned)profTickerDraws,
+      //               (unsigned long)profHeapNow,
+      //               (unsigned long)profHeapMin);
+      // #region agent log: NDJSON perf snapshot for host log capture (session dfc17c)
+      static uint32_t profNdjsonSeq = 0;
+      profNdjsonSeq++;
+      if (Serial.availableForWrite() >= 512) {
+        uint32_t tsMs = (uint32_t)millis();
+#if defined(ARDUINO_ARCH_ESP32)
+        uint32_t heapNow = ESP.getFreeHeap();
+#else
+        uint32_t heapNow = 0;
+#endif
+        (void)tsMs;
+        (void)heapNow;
+        // Serial.printf(
+        //     "NDJSON {\"sessionId\":\"dfc17c\",\"id\":\"esp_prof_%lu\",\"timestamp\":%lu,\"location\":\"loop.prof_window\","
+        //     "\"message\":\"esp32_prof_snapshot\",\"data\":{\"hypothesisId\":\"H_MULTI\",\"seq\":%lu,\"winMs\":%lu,"
+        //     "\"stat\":%lu,\"drawUsMax\":%lu,\"mainUsMax\":%lu,\"loopUsMax\":%lu,\"pollUsMax\":%lu,"
+        //     "\"statUsMax\":%lu,\"tickerUsMax\":%lu,\"tickerDraws\":%u,\"applyTdaUsMax\":%lu,\"heapNow\":%lu,\"heapMin\":%lu},"
+        //     "\"runId\":\"pre-fix\"}\n",
+        //     (unsigned long)profNdjsonSeq,
+        //     (unsigned long)tsMs,
+        //     (unsigned long)profNdjsonSeq,
+        //     (unsigned long)(nowMs - profWindowStartMs),
+        //     (unsigned long)profStatCount,
+        //     (unsigned long)profDrawUsMax,
+        //     (unsigned long)profMainContentUsMax,
+        //     (unsigned long)profLoopUsMax,
+        //     (unsigned long)profPollUsMax,
+        //     (unsigned long)profStatUsMax,
+        //     (unsigned long)profTickerUsMax,
+        //     (unsigned)profTickerDraws,
+        //     (unsigned long)profApplyTdaUsMax,
+        //     (unsigned long)heapNow,
+        //     (unsigned long)profHeapMin);
+      }
+      // #endregion
+    } else {
+      profProfSkipped++;
+    }
+    // #region agent log: H8 measure Serial.printf blocking
+    uint32_t pdt = micros() - p0;
+    if (pdt > profPrintUsMax) profPrintUsMax = pdt;
+    if (Serial.availableForWrite() >= 64) {
+      // Serial.printf("[PROF5] printUs=%lu profSent=%u profSkip=%u applyTdaUsMax=%lu\n",
+      //               (unsigned long)pdt,
+      //               (unsigned)profProfSent,
+      //               (unsigned)profProfSkipped,
+      //               (unsigned long)profApplyTdaUsMax);
+      (void)pdt;
+    }
+    // #endregion
+    profWindowStartMs = nowMs;
+    profDrawUsMax = 0;
+    profMainContentUsMax = 0;
+    profLoopUsMax = 0;
+    profPollUsMax = 0;
+    profSysInfoRuns = 0;
+    profNvsWrites = 0;
+    profFmUpdateUsMax = 0;
+    profTouchUsMax = 0;
+    profShowTimeUsMax = 0;
+    profStatMiniUsMax = 0;
+    profStatUsMax = 0;
+    profTickerUsMax = 0;
+    profTickerDraws = 0;
+    profPrintUsMax = 0;
+    profProfSent = 0;
+    profProfSkipped = 0;
+    profApplyTdaUsMax = 0;
+    profStatCount = 0;
+  }
+  // #endregion
+
   // Actualizare cache system info la 5 s (I2C doar in main loop, nu in handler web)
   if (millis() - lastSystemInfoCacheMs >= 5000) {
+    // #region agent log: H3 system info cache periodic work
+    profSysInfoRuns++;
+    // #endregion
     lastSystemInfoCacheMs = millis();
     Wire.beginTransmission(0x44);
     cachedTdaOk = (Wire.endTransmission() == 0);
@@ -2596,8 +4602,18 @@ void loop() {
   // Re-sync RTC from NTP every hour starting from boot.
   // Each cycle: up to 3 tries; if all fail, keep RTC until next scheduled cycle.
   if ((long)(millis() - nextNtpSyncDueMs) >= 0) {
-    Serial.println("[NTP] Scheduled hourly sync cycle...");
+    // Serial.println("[NTP] Scheduled hourly sync cycle...");
+#if defined(ARDUINO_ARCH_ESP32)
+    // Schedule background sync; skip if one is already running.
+    if (!ntpSyncInProgress && !ntpSyncRequested && ntpSyncTaskHandle != nullptr) {
+      ntpSyncRequested = true;
+      xTaskNotifyGive(ntpSyncTaskHandle);
+    } else {
+      // Serial.println("[NTP] Background sync already in progress/requested; skipping.");
+    }
+#else
     syncRTCWithNTPRetries();
+#endif
     nextNtpSyncDueMs += NTP_SYNC_INTERVAL_MS;
     // If we were delayed a lot, avoid running many catch-up cycles back-to-back.
     if ((long)(millis() - nextNtpSyncDueMs) >= 0) {
@@ -2607,14 +4623,14 @@ void loop() {
 
   // One-time delayed post-boot audio reapply to ensure gain latches
   if (postBootAudioApplyPending && millis() >= postBootAudioApplyAt && !standbyState) {
-    Serial.println("[TDA7439] Post-boot reapply settings");
+    // Serial.println("[TDA7439] Post-boot reapply settings");
     applyTDA7439SettingsForCurrentSource();
     postBootAudioApplyPending = false;
   }
   
   // Short-deferred apply triggered by HTTP handlers (e.g., source change)
   if (audioApplyPending && millis() >= audioApplyAt && !standbyState) {
-    Serial.println("[TDA7439] Deferred apply settings");
+    // Serial.println("[TDA7439] Deferred apply settings");
     applyTDA7439SettingsForCurrentSource();
     audioApplyPending = false;
   }
@@ -2627,9 +4643,6 @@ void loop() {
     powerOffPending = false;
     enterStandby();
   }
-
-  // Keep GPIO33 (LED/standby output) in sync with standbyState every loop
-  digitalWrite(STANDBY_OUT_PIN, standbyState ? LOW : HIGH);
 
   // GPIO32: standby button (toggle on press)
   if (buttonPressed(STANDBY_CTRL_PIN, lastStandbyState, lastStandbyPressTime)) {
@@ -2695,6 +4708,7 @@ void loop() {
     setTDA7439Balance((int8_t)Balance);
     delay(1);
     fmRadio.saveSettings();
+    fmRadio.flushSettingsIfDue(true);
     eqApplyPending = false;
   }
 
@@ -2721,20 +4735,21 @@ void loop() {
   if (Serial.available() > 0) {
     char c = Serial.read();
     if (c == 'r') {
-      Serial.println("[SYSTEM] Reset command received. Restarting ESP32...");
+      // Serial.println("[SYSTEM] Reset command received. Restarting ESP32...");
       delay(500); // Give time for the message to be sent
       ESP.restart();
     } else if (c == 't') {
-      Serial.println("[SYSTEM] Running TDA7439 communication test...");
+      // Serial.println("[SYSTEM] Running TDA7439 communication test...");
       testTDA7439Comms();
     }
   }
+#endif
 
   if (IrReceiver.decode()) {
     uint8_t irCode = IrReceiver.decodedIRData.command;
-    Serial.print("IR code: 0x");
-    Serial.println(irCode, HEX);
-    Serial.println(irCode, HEX); // Only IR code in HEX
+    // Serial.print("IR code: 0x");
+    // Serial.println(irCode, HEX);
+    // Serial.println(irCode, HEX); // Only IR code in HEX
 
     // IR code 0x1B (27 decimal) for power on/off
     if (irCode == 0x1B) {
@@ -2780,26 +4795,28 @@ void loop() {
           }
           fmRadio.updateCurrentEqValueDisplay();
           fmRadio.saveSettings();
+          fmRadio.flushSettingsIfDue(true);
           // fmRadio.drawsetScreen(); // <-- ensures value color is correct
         } else {
           // Normal mode: volume up
-          fmRadio.currentVolume = min((int32_t)(fmRadio.currentVolume + 1), (int32_t)MAX_VOLUME);
+          int32_t nextVolume = min((int32_t)(fmRadio.currentVolume + 1), (int32_t)MAX_VOLUME);
           
           // Check TDA7439 before changing volume
           Wire.beginTransmission(0x44);
           byte error = Wire.endTransmission();
           if (error == 0) {
-            fmRadio.currentVolume = fmRadio.currentVolume + 1;
+            fmRadio.currentVolume = nextVolume;
             tda7439.setVolume(fmRadio.currentVolume);
-            Serial.print("[TDA7439] Volume increased to: ");
-            Serial.println(fmRadio.currentVolume);
+            noteTdaWrite("ir", -1, fmRadio.currentVolume);
+            // Serial.print("[TDA7439] Volume increased to: ");
+            // Serial.println(fmRadio.currentVolume);
             setEncoderCount(fmRadio.currentVolume);
             encoderLastEncVal = fmRadio.currentVolume;
             fmRadio.updateVolumeDisplay();
             fmRadio.saveSettings();
           } else {
-            Serial.print("[TDA7439] NACK Error during IR volume up! Error code: ");
-            Serial.println(error);
+            // Serial.print("[TDA7439] NACK Error during IR volume up! Error code: ");
+            // Serial.println(error);
           }
           
           setEncoderCount(fmRadio.currentVolume);
@@ -2829,26 +4846,28 @@ void loop() {
           }
           fmRadio.updateCurrentEqValueDisplay();
           fmRadio.saveSettings();
+          fmRadio.flushSettingsIfDue(true);
           fmRadio.drawsetScreen(); // <-- ensures value color is correct
         } else {
           // Normal mode: volume down
-          fmRadio.currentVolume = max((int32_t)(fmRadio.currentVolume - 1), (int32_t)MIN_VOLUME);
+          int32_t nextVolume = max((int32_t)(fmRadio.currentVolume - 1), (int32_t)MIN_VOLUME);
           
           // Check TDA7439 before changing volume
           Wire.beginTransmission(0x44);
           byte error = Wire.endTransmission();
           if (error == 0) {
-            fmRadio.currentVolume = fmRadio.currentVolume - 1;
+            fmRadio.currentVolume = nextVolume;
             tda7439.setVolume(fmRadio.currentVolume);
-            Serial.print("[TDA7439] Volume decreased to: ");
-            Serial.println(fmRadio.currentVolume);
+            noteTdaWrite("ir", -1, fmRadio.currentVolume);
+            // Serial.print("[TDA7439] Volume decreased to: ");
+            // Serial.println(fmRadio.currentVolume);
             setEncoderCount(fmRadio.currentVolume);
             encoderLastEncVal = fmRadio.currentVolume;
             fmRadio.updateVolumeDisplay();
             fmRadio.saveSettings();
           } else {
-            Serial.print("[TDA7439] NACK Error during IR volume down! Error code: ");
-            Serial.println(error);
+            // Serial.print("[TDA7439] NACK Error during IR volume down! Error code: ");
+            // Serial.println(error);
           }
           
           setEncoderCount(fmRadio.currentVolume);
@@ -2873,12 +4892,12 @@ void loop() {
         }
         if (fmRadio.sursa == 1) {
           // Radio: seek down
-          Serial.println("[IR] Seek down command received");
+          // Serial.println("[IR] Seek down command received");
           fmRadio.seekDown();
         } else {
           // Other sources: NEXT source (reversed)
           fmRadio.sursa++;
-          if (fmRadio.sursa > 4) fmRadio.sursa = 1;
+          if (fmRadio.sursa > 5) fmRadio.sursa = 1;
           fmRadio.loadEqualizer();
           fmRadio.updateSelectedSourceDisplay();
           fmRadio.updateMainContent();
@@ -2901,12 +4920,12 @@ void loop() {
         }
         if (fmRadio.sursa == 1) {
           // Radio: seek up
-          Serial.println("[IR] Seek up command received");
+          // Serial.println("[IR] Seek up command received");
           fmRadio.seekUp();
         } else {
           // Other sources: PREVIOUS source (reversed)
           fmRadio.sursa--;
-          if (fmRadio.sursa < 1) fmRadio.sursa = 4;
+          if (fmRadio.sursa < 1) fmRadio.sursa = 5;
           fmRadio.loadEqualizer();
           fmRadio.updateSelectedSourceDisplay();
           fmRadio.updateMainContent();
@@ -2923,7 +4942,7 @@ void loop() {
       if (fmRadio.utilMode) {
         // In util mode: cycle through all sources
         fmRadio.sursa++;
-        if (fmRadio.sursa > 4) fmRadio.sursa = 1;
+        if (fmRadio.sursa > 5) fmRadio.sursa = 1;
         fmRadio.loadEqualizer();
         drawUtilSourceUnderline(fmRadio.sursa); // Only update the red underline
         fmRadio.updateUtilSursaChange();        // Update EQ values for new source
@@ -2935,7 +4954,7 @@ void loop() {
       }
       // Normal mode: previous source (legacy, now reversed)
       fmRadio.sursa--;
-      if (fmRadio.sursa < 1) fmRadio.sursa = 4;
+      if (fmRadio.sursa < 1) fmRadio.sursa = 5;
       fmRadio.loadEqualizer();
       fmRadio.updateSelectedSourceDisplay();
       fmRadio.updateMainContent();
@@ -2962,9 +4981,11 @@ void loop() {
   }
 
   // Normal mode
-  fmRadio.update();
-  checkTouch();
-  showTime();
+  // #region agent log: H3 measure non-RPi loop work
+  { uint32_t t0 = micros(); fmRadio.update(); uint32_t dt = micros() - t0; if (dt > profFmUpdateUsMax) profFmUpdateUsMax = dt; }
+  { uint32_t t0 = micros(); checkTouch();    uint32_t dt = micros() - t0; if (dt > profTouchUsMax)    profTouchUsMax = dt; }
+  { uint32_t t0 = micros(); showTime();      uint32_t dt = micros() - t0; if (dt > profShowTimeUsMax)  profShowTimeUsMax = dt; }
+  // #endregion
 
   // If utilMode and rtcUpdateSuccess, redraw util button to update/hide message
   if (fmRadio.utilMode && fmRadio.rtcUpdateSuccess && millis() - fmRadio.rtcUpdateMsgMillis > 2000) {
@@ -2972,15 +4993,22 @@ void loop() {
     fmRadio.drawUtilButton();
     drawsetScreen();
   }
+
+  // #region agent log: H3 measure full loop spikes
+  uint32_t loopDt = micros() - loopT0;
+  if (loopDt > profLoopUsMax) profLoopUsMax = loopDt;
+  // #endregion
+
+  // NOTE: Serial heartbeat/spike logs were useful for diagnosis but can make WebUI sluggish.
+  // They are now disabled by default (use DEBUG_SERIAL_LOGS=1 if needed again).
 }
 
 // Add this handler function near the top-level functions (after your includes and before setup/loop):
 void handleRoot() {
   if (standbyState) {
-    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    server.sendHeader("Pragma", "no-cache");
+    webHeadersNoCacheClose(server);
     server.sendHeader("Expires", "0");
-    server.send(200, "text/html", R"rawliteral(
+    static const char ROOT_STANDBY_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang='en'>
 <head>
@@ -3043,8 +5071,16 @@ void handleRoot() {
       html += "<div class='info-row'><span class='info-label'>SI4703</span><span class='" + (i2c.SI4703 ? 'i2c-ok' : 'i2c-fail') + "'>" + (i2c.SI4703 ? "OK" : "-") + "</span></div>";
       return html;
     }
+    function fetchWithTimeout(url, options, timeoutMs) {
+      var ms = (timeoutMs !== undefined && timeoutMs !== null) ? timeoutMs : 15000;
+      var controller = new AbortController();
+      var tid = setTimeout(function() { controller.abort(); }, ms);
+      var opts = options ? Object.assign({}, options) : {};
+      opts.signal = controller.signal;
+      return fetch(url, opts).finally(function() { clearTimeout(tid); });
+    }
     function refreshInfo() {
-      fetch('/systemInfo')
+      fetchWithTimeout('/systemInfo', { cache: 'no-store', credentials: 'same-origin' }, 15000)
         .then(function(r) { return r.json(); })
         .then(function(d) {
           document.getElementById('infoContent').innerHTML = renderInfo(d);
@@ -3054,22 +5090,22 @@ void handleRoot() {
         });
     }
     refreshInfo();
-    setInterval(refreshInfo, 5000);
+    setInterval(refreshInfo, 8000);
     document.getElementById('powerBtn').onclick = function() {
-      fetch('/power?state=on', {method: 'POST'})
+      fetchWithTimeout('/api/v2/power?state=on', { method: 'POST', cache: 'no-store', credentials: 'same-origin' }, 20000)
         .then(function() { location.reload(); })
         .catch(function(err) { alert('Error powering on: ' + err); });
     };
   </script>
 </body>
 </html>
-)rawliteral");
+)rawliteral";
+    webSendProgmemChunked(server, "text/html", ROOT_STANDBY_HTML);
     return;
   }
-  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  server.sendHeader("Pragma", "no-cache");
+  webHeadersNoCacheClose(server);
   server.sendHeader("Expires", "0");
-  server.send(200, "text/html", R"rawliteral(
+  static const char ROOT_MAIN_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang='en'>
 <head>
@@ -3090,6 +5126,16 @@ void handleRoot() {
     .mute-on { background: #e67e22; color: #fff; }
     .mute-off { background: #2980b9; color: #fff; }
     .seek-btn { width: 48%; margin: 1%; font-size: 1em; padding: 10px; }
+    /* Transport buttons (RPi + PCD) */
+    .transport-prevnext { background: #4fc3f7; color: #00263a; }
+    .transport-play { color: #fff; }
+    .transport-play.playing { background: #27ae60; }
+    .transport-play.paused { background: #c0392b; }
+    /* Icon-only transport buttons (SVG so no missing glyph boxes) */
+    .transport-icon { display: inline-flex; align-items: center; justify-content: center; }
+    .transport-svg { width: 2.025em; height: 2.025em; fill: currentColor; display: block; }
+    .seek-btn:disabled { opacity: 0.45; filter: grayscale(35%); cursor: not-allowed; }
+    .offline-tag { color: #e74c3c; font-weight: 700; }
     .eq-label { width: 60px; display: inline-block; }
     /* Fancy volume slider */
     .volume-row { flex-direction: column; align-items: stretch; margin: 18px 0; }
@@ -3179,27 +5225,16 @@ void handleRoot() {
     <div class='status' id='status'></div>
     <button id='powerBtn' class='btn'>Power</button>
     <button id='muteBtn' class='btn'>Mute</button>
-    <div class='volume-row'>
-      <div class='volume-label'>Volume</div>
-      <input type='range' min='0' max='48' id='volume' class='volume-slider'>
-      <div class='volume-value' id='volumeVal'></div>
-    </div>
     <div class='source-row'>
-      <button class='source-btn pc' id='src4'>PC</button>
-      <button class='source-btn rpi' id='src3'>Raspberry PI</button>
-      <button class='source-btn bt' id='src2'>Bluetooth</button>
+      <button class='source-btn pc' id='src4'>PCA</button>
+      <button class='source-btn pc' id='src5'>PCD</button>
+      <button class='source-btn rpi' id='src3'>Rpi</button>
+      <button class='source-btn bt' id='src2'>BT</button>
       <button class='source-btn tun' id='src1'>TUN</button>
     </div>
     <div class='row' id='freqRow' style='display:none;'>
       <label for='freq'>FM Freq (MHz)</label>
       <input type='number' min='87.5' max='108.0' step='0.1' id='freq'>
-    </div>
-    <div class='row' id='rssiRow' style='display:none;'>
-      <label>Signal</label>
-      <div style='display:flex; gap:12px; align-items:center;'>
-        <div id='rssiVal'>-</div>
-        <div id='wifiVal' style='opacity:0.8; font-size:0.95em;'>WiFi: - dBm</div>
-      </div>
     </div>
     <div class='row' id='rdsRow' style='display:none;'>
       <label>RDS</label>
@@ -3216,10 +5251,26 @@ void handleRoot() {
       <div><b>Artist:</b> <span id='rpiArtistVal'>-</span></div>
       <div><b>File:</b> <span id='rpiFileVal'>-</span></div>
     </div>
+    <div class='row' id='pcMetaRow' style='display:none; flex-direction:column; align-items:flex-start; gap:4px;'>
+      <div><b>Foobar:</b> <span id='pcStateVal'>-</span> | <span id='pcOnlineVal'>offline</span></div>
+      <div><b>Title:</b> <span id='pcTitleVal'>-</span></div>
+      <div><b>Artist:</b> <span id='pcArtistVal'>-</span></div>
+      <div><b>File:</b> <span id='pcExtraVal'>-</span></div>
+    </div>
+    <div class='row' id='pcCtrlRow' style='display:none; gap:8px;'>
+      <button class='seek-btn transport-prevnext' id='pcPrevBtn' aria-label='Previous' title='Previous'><span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M7 6h2v12H7V6zm3.5 6 9 6V6l-9 6z'/></svg></span></button>
+      <button class='seek-btn transport-play paused' id='pcPlayBtn' aria-label='Play/Pause' title='Play/Pause'><span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M8 5v14l11-7L8 5z'/></svg></span></button>
+      <button class='seek-btn transport-prevnext' id='pcNextBtn' aria-label='Next' title='Next'><span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M15 6h2v12h-2V6zM4.5 18l9-6-9-6v12z'/></svg></span></button>
+    </div>
     <div class='row' id='rpiCtrlRow' style='display:none; gap:8px;'>
-      <button class='seek-btn' id='rpiPrevBtn'>Prev</button>
-      <button class='seek-btn' id='rpiPlayBtn'>Play</button>
-      <button class='seek-btn' id='rpiNextBtn'>Next</button>
+      <button class='seek-btn transport-prevnext' id='rpiPrevBtn' aria-label='Previous' title='Previous'><span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M7 6h2v12H7V6zm3.5 6 9 6V6l-9 6z'/></svg></span></button>
+      <button class='seek-btn transport-play paused' id='rpiPlayBtn' aria-label='Play/Pause' title='Play/Pause'><span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M8 5v14l11-7L8 5z'/></svg></span></button>
+      <button class='seek-btn transport-prevnext' id='rpiNextBtn' aria-label='Next' title='Next'><span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M15 6h2v12h-2V6zM4.5 18l9-6-9-6v12z'/></svg></span></button>
+    </div>
+    <div class='volume-row'>
+      <div class='volume-label'>Volume</div>
+      <input type='range' min='0' max='48' id='volume' class='volume-slider'>
+      <div class='volume-value' id='volumeVal'></div>
     </div>
     <div style='margin:16px 0 8px 0; text-align:center;'>
       <b>Equalizer</b>
@@ -3229,10 +5280,209 @@ void handleRoot() {
     <div class='row'><span class='eq-label'>Treble</span><input type='range' min='-7' max='7' id='treble'><span id='trebleVal'></span></div>
     <div class='row'><span class='eq-label'>Gain</span><input type='range' min='-45' max='0' id='gain'><span id='gainVal'></span></div>
     <div class='row'><span class='eq-label'>Balance</span><input type='range' min='-15' max='15' id='balance'><span id='balanceVal'></span></div>
+    <div class='row' id='rssiRow' style='display:none;'>
+      <label>Signal</label>
+      <div style='display:flex; gap:12px; align-items:center;'>
+        <div id='rssiVal'>-</div>
+        <div id='wifiVal' style='opacity:0.8; font-size:0.95em;'>WiFi: - dBm</div>
+      </div>
+    </div>
   </div>
   <script>
-    let state = {};
-    let statusInFlight = false;
+    var state = {};
+    var presetPressTimer = null;
+    var isLongPress = false;
+
+    /** Două cozi: GET (/status, /presets) nu stau în spatele POST-urilor /rpi — evită UI înghețat la transport. */
+    var readTail = Promise.resolve();
+    var cmdTail = Promise.resolve();
+    function readThen(task) {
+      var p = readTail.then(function() { return task(); }, function() { return task(); });
+      readTail = p.catch(function() {});
+      return p;
+    }
+    function cmdThen(task) {
+      var p = cmdTail.then(function() { return task(); }, function() { return task(); });
+      cmdTail = p.catch(function() {});
+      return p;
+    }
+
+    function delay(ms) {
+      return new Promise(function(resolve) { setTimeout(resolve, ms); });
+    }
+
+    function fetchWithTimeout(url, options, timeoutMs) {
+      var ms = (timeoutMs !== undefined && timeoutMs !== null) ? timeoutMs : 10000;
+      var controller = new AbortController();
+      var tid = setTimeout(function() { controller.abort(); }, ms);
+      var opts = options ? Object.assign({}, options) : {};
+      opts.signal = controller.signal;
+      return fetch(url, opts).finally(function() { clearTimeout(tid); });
+    }
+
+    /** GET JSON fără coadă readThen — folosit rar (ex. preseturi imediat după TUN) ca să nu stea după zeci de /state blocate. */
+    function httpGetJsonBare(url, timeoutMs) {
+      var u = url + (url.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
+      var to = (timeoutMs !== undefined && timeoutMs !== null) ? timeoutMs : 9000;
+      return fetchWithTimeout(u, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json' }
+      }, to).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+    }
+
+    function httpGetJson(url) {
+      return readThen(function() {
+        return httpGetJsonBare(url, 9000);
+      });
+    }
+
+    function normalizeV2(s) {
+      // Convert v2 API shape into the legacy `state` fields the UI code expects.
+      if (!s || typeof s !== 'object') return {};
+      var out = {};
+      out.power = (s.power ? 'on' : 'off');
+      out.mute = (s.mute ? 'on' : 'off');
+      out.volume = (typeof s.volume === 'number') ? s.volume : 0;
+      out.source = (typeof s.source === 'number') ? s.source : 1;
+      out.wifi = (typeof s.wifiRssi === 'number') ? s.wifiRssi : -127;
+
+      var t = s.tuner || {};
+      out.freq = (typeof t.freq === 'number') ? t.freq : 0;
+      out.rssi = (typeof t.rssi === 'number') ? t.rssi : -1;
+      out.rds = (typeof t.rds === 'string') ? t.rds : '';
+
+      var r = s.rpi || {};
+      out.rpiOnline = !!r.online;
+      out.rpiState = r.state || '';
+      out.rpiTitle = r.title || '';
+      out.rpiArtist = r.artist || '';
+      out.rpiFile = r.file || '';
+
+      var p = s.pc || {};
+      out.pcOnline = !!p.online;
+      out.pcHttpCode = (typeof p.httpCode === 'number') ? p.httpCode : 0;
+      out.pcState = p.state || '';
+      out.pcTitle = p.title || '';
+      out.pcArtist = p.artist || '';
+      out.pcExtra = p.extra || '';
+
+      var eq = s.eq || {};
+      out.bass = (typeof eq.bass === 'number') ? eq.bass : 0;
+      out.middle = (typeof eq.middle === 'number') ? eq.middle : 0;
+      out.treble = (typeof eq.treble === 'number') ? eq.treble : 0;
+      out.gain = (typeof eq.gain === 'number') ? eq.gain : 0;
+      out.balance = (typeof eq.balance === 'number') ? eq.balance : 0;
+      return out;
+    }
+
+    var stateRefreshBusy = false;
+    var stateRefreshAgain = false;
+
+    function refreshState() {
+      if (stateRefreshBusy) {
+        stateRefreshAgain = true;
+        return Promise.resolve();
+      }
+      stateRefreshBusy = true;
+      return httpGetJson('/api/v2/state')
+        .then(function(s) {
+          state = normalizeV2(s);
+          updateUI();
+          if (state.source === 1 && !presetsLoaded) return fetchPresets(false);
+        })
+        .catch(function(err) { console.error('refreshState:', err); })
+        .finally(function() {
+          stateRefreshBusy = false;
+          if (stateRefreshAgain) {
+            stateRefreshAgain = false;
+            refreshState();
+          }
+        });
+    }
+
+    function applyStatusSnapshot(s) {
+      if (!s || typeof s !== 'object') return;
+      var snap = normalizeV2(s);
+      state = Object.assign({}, state, snap);
+      if (state.source === 1 && !presetsLoaded) fetchPresets(true);
+      updateUI();
+    }
+
+    /** După POST: dacă endpoint-ul întoarce JSON status, îl aplicăm imediat. */
+    function kickSync(resp) {
+      if (resp && typeof resp === 'object') {
+        applyStatusSnapshot(resp);
+        return Promise.resolve(resp);
+      }
+      return refreshState();
+    }
+
+    function postCmd(url) {
+      return cmdThen(function() {
+        return fetchWithTimeout(url, { method: 'POST', cache: 'no-store', credentials: 'same-origin' }, 7000)
+          .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            var ct = (r.headers.get('content-type') || '').toLowerCase();
+            if (ct.indexOf('application/json') >= 0) return r.json();
+            return r.text();
+          });
+      });
+    }
+
+    /** După schimbare sursă / power: un singur refresh întârziat (fără dublu GET). */
+    function kickSyncSlow() {
+      return delay(400).then(function() { return refreshState(); });
+    }
+
+    var transportRefreshTimer = null;
+    function isFullStatusPayload(obj) {
+      return obj && typeof obj === 'object' && ('power' in obj || 'volume' in obj || 'source' in obj);
+    }
+    function kickSyncTransport(resp) {
+      if (isFullStatusPayload(resp)) applyStatusSnapshot(resp);
+      if (transportRefreshTimer) clearTimeout(transportRefreshTimer);
+      transportRefreshTimer = setTimeout(function() {
+        transportRefreshTimer = null;
+        refreshState();
+      }, 750);
+      return Promise.resolve();
+    }
+
+    var eqSyncTimer = null;
+    var eqPostInFlight = false;
+    var volumePending = false;
+
+    function buildEqQuery() {
+      const b = document.getElementById('bass').value;
+      const m = document.getElementById('middle').value;
+      const t = document.getElementById('treble').value;
+      const g = document.getElementById('gain').value;
+      const bal = document.getElementById('balance').value;
+      return 'bass=' + encodeURIComponent(b) + '&middle=' + encodeURIComponent(m) + '&treble=' + encodeURIComponent(t)
+        + '&gain=' + encodeURIComponent(g) + '&balance=' + encodeURIComponent(bal);
+    }
+
+    function scheduleEqSync() {
+      clearTimeout(eqSyncTimer);
+      eqSyncTimer = setTimeout(function() {
+        eqSyncTimer = null;
+        eqPostInFlight = true;
+        postCmd('/api/v2/eq?' + buildEqQuery())
+          .then(function() { return kickSync(); })
+          .catch(function(err) { console.error('Error setting EQ:', err); })
+          .finally(function() { eqPostInFlight = false; });
+      }, 200);
+    }
+    function onEqSliderInput(valElId) {
+      return function(e) {
+        document.getElementById(valElId).textContent = e.target.value;
+        scheduleEqSync();
+      };
+    }
     let presets = [];
     let presetsLoaded = false;
     let lastRenderedFreq = null;
@@ -3248,15 +5498,12 @@ void handleRoot() {
         name: name || `Preset ${id + 1}`
       });
       
-      fetch('/preset?' + params, {method: 'POST'})
-        .then(response => {
-          if (!response.ok) throw new Error('Network response was not ok');
-          return response.text();
-        })
-        .then(() => {
+      postCmd('/preset?' + params.toString())
+        .then(function() {
           console.log('Preset stored successfully');
-          return Promise.all([fetchPresets(), fetchStatus()]);
+          return fetchPresets(true);
         })
+        .then(function() { return kickSync(); })
         .catch(err => console.error('Error storing preset:', err));
     }
 
@@ -3272,15 +5519,10 @@ void handleRoot() {
         const maxRetries = 3;
         
         function attemptRecall() {
-          fetch('/freq?value=' + preset.freq, {method: 'POST'})
-            .then(response => {
-              if (!response.ok) throw new Error('Network response was not ok');
-              return response.text();
-            })
-            .then(() => {
+          postCmd('/freq?value=' + preset.freq)
+            .then(function() {
               console.log('Preset recalled successfully');
-              // Update the UI to reflect the change
-              updateUI();
+              return kickSync();
             })
             .catch(err => {
               console.error('Error recalling preset:', err);
@@ -3296,7 +5538,7 @@ void handleRoot() {
                 statusDiv.style.color = '#ff4444';
                 setTimeout(() => {
                   statusDiv.textContent = '';
-                  fetchStatus(); // Refresh status to get actual state
+                  refreshState();
                 }, 3000);
               }
             });
@@ -3431,15 +5673,18 @@ void handleRoot() {
       });
     }
 
-    function fetchPresets() {
-      fetch('/presets')
-        .then(r => r.json())
-        .then(arr => {
-          presets = arr;
-          presetsLoaded = true;
-          renderPresets();
-        })
-        .catch(err => console.error('Error fetching presets:', err));
+    function fetchPresets(urgent) {
+      var run = function() {
+        return httpGetJsonBare('/presets', 8000)
+          .then(function(arr) {
+            presets = arr;
+            presetsLoaded = true;
+            renderPresets();
+          })
+          .catch(function(err) { console.error('Error fetching presets:', err); });
+      };
+      if (urgent) return run();
+      return readThen(run);
     }
 
     function updateUI() {
@@ -3453,11 +5698,13 @@ void handleRoot() {
       muteBtn.className = 'btn ' + (state.mute === 'on' ? 'mute-on' : 'mute-off');
       muteBtn.textContent = state.mute === 'on' ? 'Unmute' : 'Mute';
 
-      // Update volume
+      // Update volume (nu suprascrie în timpul tragerii / până vine răspunsul de la POST)
       const volumeSlider = document.getElementById('volume');
       const volumeVal = document.getElementById('volumeVal');
-      volumeSlider.value = state.volume;
-      volumeVal.textContent = state.volume;
+      if (!volumePending && document.activeElement !== volumeSlider) {
+        volumeSlider.value = state.volume;
+        volumeVal.textContent = state.volume;
+      }
 
       // Update source buttons
       document.querySelectorAll('.source-btn').forEach(btn => {
@@ -3474,6 +5721,63 @@ void handleRoot() {
       const presetRow = document.getElementById('presetRow');
       const rpiMetaRow = document.getElementById('rpiMetaRow');
       const rpiCtrlRow = document.getElementById('rpiCtrlRow');
+      const pcMetaRow = document.getElementById('pcMetaRow');
+      const pcCtrlRow = document.getElementById('pcCtrlRow');
+      const rpiTransportBtns = [
+        document.getElementById('rpiPrevBtn'),
+        document.getElementById('rpiPlayBtn'),
+        document.getElementById('rpiNextBtn')
+      ];
+      const pcTransportBtns = [
+        document.getElementById('pcPrevBtn'),
+        document.getElementById('pcPlayBtn'),
+        document.getElementById('pcNextBtn')
+      ];
+      function setTransportEnabled(btns, enabled) {
+        btns.forEach(function(b) { if (b) b.disabled = !enabled; });
+      }
+      function normalizePlaybackState(rawState) {
+        const s = (rawState || '').toLowerCase();
+        if (s === 'playing') return 'play';
+        if (s === 'paused') return 'pause';
+        if (s === 'stopped') return 'stop';
+        return s;
+      }
+      function applyTransportPanel(cfg) {
+        function svgPlay() {
+          return "<span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M8 5v14l11-7L8 5z'/></svg></span>";
+        }
+        function svgPause() {
+          return "<span class='transport-icon'><svg class='transport-svg' viewBox='0 0 24 24' aria-hidden='true'><path d='M6 5h4v14H6V5zm8 0h4v14h-4V5z'/></svg></span>";
+        }
+        if (!cfg.online) {
+          cfg.onlineEl.textContent = 'Offline';
+          cfg.onlineEl.className = 'offline-tag';
+          cfg.onlineEl.style.display = 'inline';
+          cfg.stateEl.textContent = 'Offline';
+          cfg.titleEl.textContent = 'Offline';
+          cfg.artistEl.textContent = 'Offline';
+          cfg.extraEl.textContent = 'Offline';
+          cfg.playBtn.innerHTML = svgPlay();
+          cfg.playBtn.classList.remove('playing');
+          cfg.playBtn.classList.add('paused');
+          setTransportEnabled(cfg.btns, false);
+          return;
+        }
+        cfg.onlineEl.textContent = '';
+        cfg.onlineEl.className = '';
+        cfg.onlineEl.style.display = 'none';
+        cfg.stateEl.textContent = cfg.stateValue || '-';
+        cfg.titleEl.textContent = cfg.titleValue || '-';
+        cfg.artistEl.textContent = cfg.artistValue || '-';
+        cfg.extraEl.textContent = cfg.extraValue || '-';
+        const norm = normalizePlaybackState(cfg.stateValue);
+        const isPlaying = (norm === 'play');
+        cfg.playBtn.innerHTML = isPlaying ? svgPause() : svgPlay();
+        cfg.playBtn.classList.toggle('playing', isPlaying);
+        cfg.playBtn.classList.toggle('paused', !isPlaying);
+        setTransportEnabled(cfg.btns, true);
+      }
       if (state.source === 1) { // TUN
         freqRow.style.display = 'flex';
         rssiRow.style.display = 'flex';
@@ -3482,6 +5786,10 @@ void handleRoot() {
         presetRow.style.display = 'flex';
         rpiMetaRow.style.display = 'none';
         rpiCtrlRow.style.display = 'none';
+        pcMetaRow.style.display = 'none';
+        pcCtrlRow.style.display = 'none';
+        setTransportEnabled(rpiTransportBtns, false);
+        setTransportEnabled(pcTransportBtns, false);
         
         // Only update frequency input if it's not focused
         const freqInput = document.getElementById('freq');
@@ -3539,26 +5847,53 @@ void handleRoot() {
         rssiEl.textContent = 'FM: -';
         rssiEl.style.opacity = '0.6';
         rssiEl.style.color = '#bbb';
-        if (state.source === 3) { // Raspberry PI
+        if (state.source === 3) { // RPi
           rpiMetaRow.style.display = 'flex';
           rpiCtrlRow.style.display = 'flex';
-          document.getElementById('rpiOnlineVal').textContent = state.rpiOnline ? 'online' : 'offline';
-          document.getElementById('rpiOnlineVal').style.color = state.rpiOnline ? '#27ae60' : '#e74c3c';
-          document.getElementById('rpiStateVal').textContent = state.rpiState || '-';
-          document.getElementById('rpiTitleVal').textContent = state.rpiTitle || '-';
-          document.getElementById('rpiArtistVal').textContent = state.rpiArtist || '-';
-          document.getElementById('rpiFileVal').textContent = state.rpiFile || '-';
-          const rpiPlayBtn = document.getElementById('rpiPlayBtn');
-          const rpiStateNorm = (state.rpiState || '').toLowerCase();
-          // Button shows the next action: Pauza when playing, Play when paused/stopped.
-          if (rpiStateNorm === 'play' || rpiStateNorm === 'playing') {
-            rpiPlayBtn.textContent = 'Pauza';
-          } else {
-            rpiPlayBtn.textContent = 'Play';
-          }
+          pcMetaRow.style.display = 'none';
+          pcCtrlRow.style.display = 'none';
+        applyTransportPanel({
+          online: !!state.rpiOnline,
+          onlineEl: document.getElementById('rpiOnlineVal'),
+          stateEl: document.getElementById('rpiStateVal'),
+          titleEl: document.getElementById('rpiTitleVal'),
+          artistEl: document.getElementById('rpiArtistVal'),
+          extraEl: document.getElementById('rpiFileVal'),
+          stateValue: state.rpiState,
+          titleValue: state.rpiTitle,
+          artistValue: state.rpiArtist,
+          extraValue: state.rpiFile,
+          playBtn: document.getElementById('rpiPlayBtn'),
+          btns: rpiTransportBtns
+        });
+          setTransportEnabled(pcTransportBtns, false);
+        } else if (state.source === 5) { // PCD (foobar on RPi input)
+          rpiMetaRow.style.display = 'none';
+          rpiCtrlRow.style.display = 'none';
+          pcMetaRow.style.display = 'flex';
+          pcCtrlRow.style.display = 'flex';
+        applyTransportPanel({
+          online: !!state.pcOnline,
+          onlineEl: document.getElementById('pcOnlineVal'),
+          stateEl: document.getElementById('pcStateVal'),
+          titleEl: document.getElementById('pcTitleVal'),
+          artistEl: document.getElementById('pcArtistVal'),
+          extraEl: document.getElementById('pcExtraVal'),
+          stateValue: state.pcState,
+          titleValue: state.pcTitle,
+          artistValue: state.pcArtist,
+          extraValue: state.pcExtra,
+          playBtn: document.getElementById('pcPlayBtn'),
+          btns: pcTransportBtns
+        });
+          setTransportEnabled(rpiTransportBtns, false);
         } else {
           rpiMetaRow.style.display = 'none';
           rpiCtrlRow.style.display = 'none';
+          pcMetaRow.style.display = 'none';
+          pcCtrlRow.style.display = 'none';
+          setTransportEnabled(rpiTransportBtns, false);
+          setTransportEnabled(pcTransportBtns, false);
         }
         // Update WiFi RSSI (dBm)
         const wifiEl = document.getElementById('wifiVal');
@@ -3577,17 +5912,25 @@ void handleRoot() {
         }
       }
 
-      // Update EQ values
-      document.getElementById('bass').value = state.bass;
-      document.getElementById('bassVal').textContent = state.bass;
-      document.getElementById('middle').value = state.middle;
-      document.getElementById('middleVal').textContent = state.middle;
-      document.getElementById('treble').value = state.treble;
-      document.getElementById('trebleVal').textContent = state.treble;
-      document.getElementById('gain').value = state.gain;
-      document.getElementById('gainVal').textContent = state.gain;
-      document.getElementById('balance').value = state.balance;
-      document.getElementById('balanceVal').textContent = state.balance;
+      // Update EQ — nu suprascrie cât e debounce sau POST în curs sau slider focalizat (evită „arată una, e alta”)
+      const eqIds = ['bass', 'middle', 'treble', 'gain', 'balance'];
+      const eqKeys = ['bass', 'middle', 'treble', 'gain', 'balance'];
+      let eqUiLocked = (eqSyncTimer !== null) || eqPostInFlight;
+      if (!eqUiLocked) {
+        for (var ei = 0; ei < eqIds.length; ei++) {
+          if (document.activeElement === document.getElementById(eqIds[ei])) {
+            eqUiLocked = true;
+            break;
+          }
+        }
+      }
+      if (!eqUiLocked) {
+        for (var ej = 0; ej < eqIds.length; ej++) {
+          var el = document.getElementById(eqIds[ej]);
+          el.value = state[eqKeys[ej]];
+          document.getElementById(eqIds[ej] + 'Val').textContent = state[eqKeys[ej]];
+        }
+      }
       
       // Update presets only when frequency actually changed
       if (state.source === 1 && state.freq !== lastRenderedFreq) {
@@ -3596,158 +5939,131 @@ void handleRoot() {
       }
     }
 
-    function fetchStatus() {
-      if (statusInFlight) return;
-      statusInFlight = true;
-      fetch('/status')
-        .then(r => r.json())
-        .then(s => {
-          state = s;
-          if (state.source === 1 && !presetsLoaded) {
-            fetchPresets();
-          }
-          updateUI();
-        })
-        .catch(err => {
-          console.error('Error fetching status:', err);
-          // Don't show error to user, just retry later
-        })
-        .finally(() => { statusInFlight = false; });
-    }
-
     // Event handlers
-    document.getElementById('powerBtn').onclick = () => {
-      const goingToStandby = (state.power === 'on');
-      fetch('/power?state=' + (goingToStandby ? 'off' : 'on'), {method: 'POST'})
-        .then(() => {
+    document.getElementById('powerBtn').onclick = function() {
+      var goingToStandby = (state.power === 'on');
+      postCmd('/api/v2/power?state=' + (goingToStandby ? 'off' : 'on'))
+        .then(function(resp) {
+          kickSync(resp);
           if (goingToStandby) {
-            // If we just powered off, reload to show standby UI
-            setTimeout(() => location.reload(), 300);
+            setTimeout(function() { location.reload(); }, 300);
           } else {
-            fetchStatus();
+            return kickSyncSlow();
           }
         })
-        .catch(err => console.error('Error toggling power:', err));
+        .catch(function(err) { console.error('Error toggling power:', err); });
     };
 
-    document.getElementById('muteBtn').onclick = () => {
-      fetch('/mute?state=' + (state.mute === 'on' ? 'off' : 'on'), {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error toggling mute:', err));
+    document.getElementById('muteBtn').onclick = function() {
+      postCmd('/api/v2/mute?state=' + (state.mute === 'on' ? 'off' : 'on'))
+        .then(function(resp) { return kickSync(resp); })
+        .catch(function(err) { console.error('Error toggling mute:', err); });
     };
 
-    // Debounce volume updates to avoid flooding the ESP with requests
-    let volumeInputTimeout;
-    document.getElementById('volume').addEventListener('input', (e) => {
+    var volumeInputTimeout;
+    document.getElementById('volume').addEventListener('input', function(e) {
+      volumePending = true;
+      document.getElementById('volumeVal').textContent = e.target.value;
       clearTimeout(volumeInputTimeout);
-      const value = e.target.value;
-      volumeInputTimeout = setTimeout(() => {
-        fetch('/volume?value=' + value, {method: 'POST'})
-          .then(() => fetchStatus())
-          .catch(err => console.error('Error setting volume:', err));
-      }, 200);
+      var value = e.target.value;
+      volumeInputTimeout = setTimeout(function() {
+        postCmd('/api/v2/volume?value=' + value)
+          .then(function(resp) { return kickSync(resp); })
+          .then(function() { volumePending = false; })
+          .catch(function(err) {
+            volumePending = false;
+            console.error('Error setting volume:', err);
+          });
+      }, 150);
     });
 
-    document.querySelectorAll('.source-btn').forEach(btn => {
-      btn.onclick = (e) => {
-        const source = parseInt(e.target.id.replace('src', ''));
-        fetch('/source?value=' + source, {method: 'POST'})
-          .then(() => {
-            if (source === 1 && !presetsLoaded) fetchPresets();
-            return fetchStatus();
+    document.querySelectorAll('.source-btn').forEach(function(btn) {
+      btn.onclick = function(e) {
+        var source = parseInt(e.target.id.replace('src', ''), 10);
+        postCmd('/api/v2/source?value=' + source)
+          .then(function(j) {
+            if (j && typeof j === 'object') applyStatusSnapshot(j);
+            return kickSyncSlow();
           })
-          .catch(err => console.error('Error setting source:', err));
+          .catch(function(err) { console.error('Error setting source:', err); });
       };
     });
 
-    document.getElementById('freq').onchange = (e) => {
-      fetch('/freq?value=' + e.target.value, {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error setting frequency:', err));
+    document.getElementById('freq').onchange = function(e) {
+      postCmd('/freq?value=' + e.target.value)
+        .then(function() { return kickSync(); })
+        .catch(function(err) { console.error('Error setting frequency:', err); });
     };
 
-    function seek(dir) {
-      fetch('/seek?dir=' + dir, {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error seeking:', err));
-    }
-
-    function rpiCmd(cmd) {
-      fetch('/rpi?cmd=' + encodeURIComponent(cmd), {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error sending RPI command:', err));
-    }
-
-    // EQ handlers
-    document.getElementById('bass').oninput = (e) => {
-      fetch('/eq?bass=' + e.target.value, {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error setting bass:', err));
+    window.seek = function(dir) {
+      postCmd('/api/v2/tuner/seek?dir=' + dir)
+        .then(function() { return kickSync(); })
+        .catch(function(err) { console.error('Error seeking:', err); });
     };
 
-    document.getElementById('middle').oninput = (e) => {
-      fetch('/eq?middle=' + e.target.value, {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error setting middle:', err));
+    window.rpiCmd = function(cmd) {
+      if (!state.rpiOnline) return Promise.resolve();
+      postCmd('/api/v2/rpi/cmd?cmd=' + encodeURIComponent(cmd))
+        .then(function(resp) { return kickSyncTransport(resp); })
+        .catch(function(err) { console.error('Error sending RPI command:', err); });
     };
 
-    document.getElementById('treble').oninput = (e) => {
-      fetch('/eq?treble=' + e.target.value, {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error setting treble:', err));
+    window.pcCmd = function(cmd) {
+      if (!state.pcOnline) return Promise.resolve();
+      postCmd('/api/v2/pc/cmd?cmd=' + encodeURIComponent(cmd))
+        .then(function(resp) { return kickSyncTransport(resp); })
+        .catch(function(err) { console.error('Error sending PC command:', err); });
     };
 
-    document.getElementById('gain').oninput = (e) => {
-      fetch('/eq?gain=' + e.target.value, {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error setting gain:', err));
-    };
+    // EQ handlers (debounced + un singur POST pentru toate canalele)
+    document.getElementById('bass').oninput = onEqSliderInput('bassVal');
+    document.getElementById('middle').oninput = onEqSliderInput('middleVal');
+    document.getElementById('treble').oninput = onEqSliderInput('trebleVal');
+    document.getElementById('gain').oninput = onEqSliderInput('gainVal');
+    document.getElementById('balance').oninput = onEqSliderInput('balanceVal');
 
-    document.getElementById('balance').oninput = (e) => {
-      fetch('/eq?balance=' + e.target.value, {method: 'POST'})
-        .then(() => fetchStatus())
-        .catch(err => console.error('Error setting balance:', err));
-    };
+    document.getElementById('rpiPrevBtn').onclick = function() { rpiCmd('PREV'); };
+    document.getElementById('rpiPlayBtn').onclick = function() { rpiCmd('PLAYPAUSE'); };
+    document.getElementById('rpiNextBtn').onclick = function() { rpiCmd('NEXT'); };
 
-    document.getElementById('rpiPrevBtn').onclick = () => rpiCmd('PREV');
-    document.getElementById('rpiPlayBtn').onclick = () => rpiCmd('PLAYPAUSE');
-    document.getElementById('rpiNextBtn').onclick = () => rpiCmd('NEXT');
+    document.getElementById('pcPrevBtn').onclick = function() { pcCmd('PREV'); };
+    document.getElementById('pcPlayBtn').onclick = function() { pcCmd('PLAYPAUSE'); };
+    document.getElementById('pcNextBtn').onclick = function() { pcCmd('NEXT'); };
 
-    // Initial load
-    fetchStatus();
-    // Update every 5 seconds
-    setInterval(fetchStatus, 8000);
-
-    // Add frequency input handling
-    let freqInputTimeout;
-    document.getElementById('freq').addEventListener('input', function(e) {
-      // Clear any pending timeout
-      clearTimeout(freqInputTimeout);
-      
-      // Set a new timeout to update the frequency after typing stops
-      freqInputTimeout = setTimeout(() => {
-        const value = parseFloat(e.target.value);
-        if (!isNaN(value) && value >= 87.5 && value <= 108.0) {
-          fetch('/freq?value=' + value, {method: 'POST'})
-            .then(() => fetchStatus())
-            .catch(err => console.error('Error setting frequency:', err));
-        }
-      }, 500); // Wait 500ms after typing stops
+    setTimeout(function() {
+      refreshState();
+      setInterval(function() { if (!document.hidden) refreshState(); }, 20000);
+    }, 500);
+    document.addEventListener('visibilitychange', function() {
+      if (!document.hidden) refreshState();
     });
 
-    // Add blur handler to update frequency when input loses focus
+    var freqInputTimeout;
+    document.getElementById('freq').addEventListener('input', function(e) {
+      clearTimeout(freqInputTimeout);
+      freqInputTimeout = setTimeout(function() {
+        var value = parseFloat(e.target.value);
+        if (!isNaN(value) && value >= 87.5 && value <= 108.0) {
+          postCmd('/freq?value=' + value)
+            .then(function() { return kickSync(); })
+            .catch(function(err) { console.error('Error setting frequency:', err); });
+        }
+      }, 500);
+    });
+
     document.getElementById('freq').addEventListener('blur', function(e) {
-      const value = parseFloat(e.target.value);
+      var value = parseFloat(e.target.value);
       if (!isNaN(value) && value >= 87.5 && value <= 108.0) {
-        fetch('/freq?value=' + value, {method: 'POST'})
-          .then(() => fetchStatus())
-          .catch(err => console.error('Error setting frequency:', err));
+        postCmd('/freq?value=' + value)
+          .then(function() { return kickSync(); })
+          .catch(function(err) { console.error('Error setting frequency:', err); });
       }
     });
   </script>
 </body>
 </html>
-)rawliteral");
+)rawliteral";
+  webSendProgmemChunked(server, "text/html", ROOT_MAIN_HTML);
 }
 
 // Add these web handlers near the top-level functions (after your includes and before setup/loop):
@@ -3760,14 +6076,18 @@ void handlePower() {
         standbyState = false;
         powerOnPending = true;
       }
-      server.send(200, "text/plain", "Power ON");      
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     } else if (state == "off") {
       // Respond immediately, perform work in main loop
       if (!standbyState) {
         standbyState = true;
         powerOffPending = true;
       }      
-      server.send(200, "text/plain", "Power OFF");
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     } else {
       server.send(400, "text/plain", "Invalid state");
     }
@@ -3780,21 +6100,277 @@ void handlePowerState() {
   server.send(200, "text/plain", standbyState ? "off" : "on");
 }
 
+// --------------------------------------------------------------------------------------------------
+// Web API v2 (non-blocking, per-source)
+// --------------------------------------------------------------------------------------------------
+
+static void handleApiV2State() {
+  if (webStatusBusy) {
+    webSendText(server, 503, "busy");
+    return;
+  }
+  webStatusBusy = true;
+  webSendStateV2(server);
+  webStatusBusy = false;
+}
+
+static void handleApiV2Power() {
+  if (server.method() != HTTP_POST || !server.hasArg("state")) {
+    webSendBadRequest(server, "Missing state");
+    return;
+  }
+  String state = server.arg("state");
+  if (state == "on") {
+    if (standbyState) {
+      standbyState = false;
+      powerOnPending = true;
+    }
+    webSendStateV2(server);
+    return;
+  }
+  if (state == "off") {
+    if (!standbyState) {
+      standbyState = true;
+      powerOffPending = true;
+    }
+    webSendStateV2(server);
+    return;
+  }
+  webSendBadRequest(server, "Invalid state");
+}
+
+static void handleApiV2Mute() {
+  if (webRejectIfStandby(server)) return;
+  if (server.method() != HTTP_POST || !server.hasArg("state")) {
+    webSendBadRequest(server, "Missing state");
+    return;
+  }
+  String state = server.arg("state");
+  if (state == "on") {
+    if (!fmRadio.isMuted) fmRadio.toggleMute();
+  } else if (state == "off") {
+    if (fmRadio.isMuted) fmRadio.toggleMute();
+  } else {
+    webSendBadRequest(server, "Invalid state");
+    return;
+  }
+  webSendStateV2(server);
+}
+
+static void handleApiV2Volume() {
+  if (webRejectIfStandby(server)) return;
+  if (server.method() != HTTP_POST || !server.hasArg("value")) {
+    webSendBadRequest(server, "Missing value");
+    return;
+  }
+  int v = server.arg("value").toInt();
+  v = constrain(v, MIN_VOLUME, MAX_VOLUME);
+  if (fmRadio.currentVolume != v) {
+    fmRadio.currentVolume = v;
+    pendingVolume = v;
+    volumeApplyPending = true;
+  }
+  webSendStateV2(server);
+}
+
+static void handleApiV2Source() {
+  if (webRejectIfStandby(server)) return;
+  if (server.method() != HTTP_POST || !server.hasArg("value")) {
+    webSendBadRequest(server, "Missing value");
+    return;
+  }
+  int s = server.arg("value").toInt();
+  if (s < 1 || s > 5) {
+    webSendBadRequest(server, "Invalid source");
+    return;
+  }
+  fmRadio.sursa = s;
+  fmRadio.sursaVeche = fmRadio.sursa;
+  fmRadio.lastSourceChangeMs = millis();
+  if (s == 3) {
+    rpiBridgeArmed = true;
+  }
+  audioApplyPending = true;
+  audioApplyAt = millis();
+  uiRefreshPending = true;
+  fmRadio.saveSettings();
+  webSendStateV2(server);
+}
+
+static void handleApiV2Eq() {
+  if (webRejectIfStandby(server)) return;
+  bool changed = false;
+  if (server.hasArg("bass")) {
+    int bass = constrain(server.arg("bass").toInt(), -7, 7);
+    if (Bass != bass) { Bass = bass; changed = true; }
+  }
+  if (server.hasArg("middle")) {
+    int middle = constrain(server.arg("middle").toInt(), -7, 7);
+    if (Middle != middle) { Middle = middle; changed = true; }
+  }
+  if (server.hasArg("treble")) {
+    int treble = constrain(server.arg("treble").toInt(), -7, 7);
+    if (Treble != treble) { Treble = treble; changed = true; }
+  }
+  if (server.hasArg("gain")) {
+    int gain = constrain(server.arg("gain").toInt(), -45, 0);
+    if (Gain != gain) { Gain = gain; changed = true; }
+  }
+  if (server.hasArg("balance")) {
+    int balance = constrain(server.arg("balance").toInt(), -15, 15);
+    if (Balance != balance) { Balance = balance; changed = true; }
+  }
+  if (changed) eqApplyPending = true;
+  webSendStateV2(server);
+}
+
+// PC bridge connectivity self-test (runs on ESP32).
+static void handleApiV2PcTest() {
+  webHeadersNoCacheClose(server);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  WebChunkedWriter w(server);
+  w.write("{");
+
+  w.write("\"esp\":{");
+  w.write("\"ip\":"); w.writeJsonEscaped(WiFi.localIP().toString().c_str()); w.write(",");
+  w.write("\"gw\":"); w.writeJsonEscaped(WiFi.gatewayIP().toString().c_str()); w.write(",");
+  w.write("\"mask\":"); w.writeJsonEscaped(WiFi.subnetMask().toString().c_str());
+  w.write("},");
+
+  w.write("\"target\":{");
+  w.write("\"host\":"); w.writeJsonEscaped(PC_BRIDGE_HOST); w.write(",");
+  w.write("\"port\":"); w.writeInt((long)PC_BRIDGE_PORT);
+  w.write("},");
+
+  int code = -1;
+  uint32_t dt = 0;
+  bool ok = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient c;
+    const uint32_t t0 = millis();
+    IPAddress ip;
+    const bool isIp = ip.fromString(PC_BRIDGE_HOST);
+    bool connected = false;
+    while ((millis() - t0) <= PC_BRIDGE_TIMEOUT_MS) {
+      if (isIp) connected = c.connect(ip, PC_BRIDGE_PORT);
+      else connected = c.connect(PC_BRIDGE_HOST, PC_BRIDGE_PORT);
+      if (connected) break;
+      delay(10);
+    }
+    dt = millis() - t0;
+    if (connected) {
+      ok = true;
+      code = 200;
+      c.stop();
+    } else {
+      ok = false;
+      code = -11;
+    }
+  } else {
+    ok = false;
+    code = -1;
+  }
+
+  w.write("\"result\":{");
+  w.write("\"ok\":"); w.write(ok ? "true" : "false"); w.write(",");
+  w.write("\"code\":"); w.writeInt((long)code); w.write(",");
+  w.write("\"dtMs\":"); w.writeInt((long)dt);
+  w.write("}");
+
+  w.write("}");
+  w.flush();
+  webEndStream(server);
+}
+
+static void handleApiV2TunerSeek() {
+  if (webRejectIfStandby(server)) return;
+  if (server.method() != HTTP_POST || !server.hasArg("dir")) {
+    webSendBadRequest(server, "Missing dir");
+    return;
+  }
+  if (fmRadio.sursa != 1) {
+    webSendConflict(server, "Source is not TUN");
+    return;
+  }
+  String dir = server.arg("dir");
+  if (dir == "up") pendingSeekDir = 1;
+  else if (dir == "down") pendingSeekDir = -1;
+  else { webSendBadRequest(server, "Invalid dir"); return; }
+  webSendStateV2(server);
+}
+
+static void handleApiV2RpiCmd() {
+  if (webRejectIfStandby(server)) return;
+#if PC_ONLY_FOOBAR
+  webSendConflict(server, "RPi bridge disabled (PC-only mode)");
+  return;
+#endif
+  if (server.method() != HTTP_POST || !server.hasArg("cmd")) {
+    webSendBadRequest(server, "Missing cmd");
+    return;
+  }
+  if (fmRadio.sursa != 3) {
+    webSendConflict(server, "RPi controls only on RPI");
+    return;
+  }
+  rpiBridgeArmed = true;
+  String cmd = server.arg("cmd");
+  cmd.toUpperCase();
+  if (cmd == "PREV" || cmd == "NEXT" || cmd == "PLAYPAUSE" || cmd == "GET") {
+#if defined(ARDUINO_ARCH_ESP32)
+    setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), cmd.c_str(), &rpiWebCmdMux);
+#else
+    setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), cmd.c_str());
+#endif
+    rpiWebCmdNextTryMs = 0;
+    webSendStateV2(server);
+    return;
+  }
+  webSendBadRequest(server, "Invalid cmd");
+}
+
+static void handleApiV2PcCmd() {
+  if (webRejectIfStandby(server)) return;
+  if (server.method() != HTTP_POST || !server.hasArg("cmd")) {
+    webSendBadRequest(server, "Missing cmd");
+    return;
+  }
+  if (fmRadio.sursa != 5) {
+    webSendConflict(server, "PC controls only on PCD");
+    return;
+  }
+  String cmd = server.arg("cmd");
+  cmd.toUpperCase();
+  if (cmd == "PREV" || cmd == "NEXT" || cmd == "PLAYPAUSE" || cmd == "PLAY" || cmd == "PAUSE" || cmd == "STOP") {
+#if defined(ARDUINO_ARCH_ESP32)
+    setPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmd.c_str(), &pcWebCmdMux);
+#else
+    setPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmd.c_str());
+#endif
+    webSendStateV2(server);
+    return;
+  }
+  webSendBadRequest(server, "Invalid cmd");
+}
+
 // --- Web Control Endpoints ---
 // Mute
 void handleMute() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
-    return;
-  }
+  if (webRejectIfStandby(server)) return;
   if (server.method() == HTTP_POST && server.hasArg("state")) {
     String state = server.arg("state");
     if (state == "on") {
       if (!fmRadio.isMuted) fmRadio.toggleMute();
-      server.send(200, "text/plain", "Muted");
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     } else if (state == "off") {
       if (fmRadio.isMuted) fmRadio.toggleMute();
-      server.send(200, "text/plain", "Unmuted");
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     } else {
       server.send(400, "text/plain", "Invalid state");
     }
@@ -3807,10 +6383,7 @@ void handleMute() {
 
 // Volume
 void handleVolume() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
-    return;
-  }
+  if (webRejectIfStandby(server)) return;
   if (server.method() == HTTP_POST && server.hasArg("value")) {
     int v = server.arg("value").toInt();
     v = constrain(v, MIN_VOLUME, MAX_VOLUME);
@@ -3819,9 +6392,13 @@ void handleVolume() {
       fmRadio.currentVolume = v;
       pendingVolume = v;
       volumeApplyPending = true;
-      server.send(200, "text/plain", String(v));
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     } else {
-      server.send(200, "text/plain", String(v));
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     }
     return;
   } else if (server.method() == HTTP_GET) {
@@ -3833,33 +6410,42 @@ void handleVolume() {
 
 // Source
 void handleSource() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
-    return;
-  }
+  if (webRejectIfStandby(server)) return;
   if (server.method() == HTTP_POST && server.hasArg("value")) {
     int s = server.arg("value").toInt();
-    // Mapping: 1=TUN, 2=Bluetooth, 3=Raspberry PI, 4=PC
-    Serial.print("[WEB SRC] Received source value: ");
-    Serial.println(s);
-    if (s >= 1 && s <= 4) {
-      fmRadio.sursa = s;
-      fmRadio.loadEqualizer();  // Load EQ for new source before any save
-      // Defer heavy I2C apply to main loop to keep HTTP responsive
+    // Mapping:
+    // 1=TUN, 2=Bluetooth, 3=Raspberry PI, 4=PCA (PC input), 5=PCD (RPi input + foobar controls)
+    // Serial.print("[WEB SRC] Received source value: ");
+    // Serial.println(s);
+    if (s >= 1 && s <= 5) {
+      if (s == 5) {
+        fmRadio.sursa = 5;
+        pcdMode = false;
+        pcAnalogUi = false;
+      } else if (s == 3) {
+        fmRadio.sursa = 3;
+        pcdMode = false;
+        rpiBridgeArmed = true;
+      } else {
+        fmRadio.sursa = s;
+        pcdMode = false;
+        if (s == 4) pcAnalogUi = true;
+      }
+      // Keep MCP "physical source" logic from immediately overwriting a WebUI change.
+      // `readSensors()` compares `newSource` with `sursaVeche`; if `sursaVeche` is stale (e.g. 4 while WebUI set 3),
+      // it will treat it as a "physical change" even with no buttons pressed and will force `pcdMode=false`.
+      fmRadio.sursaVeche = fmRadio.sursa;
+      fmRadio.lastSourceChangeMs = millis();
+      // Defer NVS EQ load + I2C apply to main loop to keep HTTP responsive
       audioApplyPending = true;
       audioApplyAt = millis();
-      Serial.print("[WEB SRC] fmRadio.sursa is now ");
-      Serial.println(fmRadio.sursa);
+      // Serial.print("[WEB SRC] fmRadio.sursa is now ");
+      // Serial.println(fmRadio.sursa);
       uiRefreshPending = true;
       fmRadio.saveSettings();
-      // Return EQ values as JSON
-      String json = "{";
-      json += "\"bass\":" + String(Bass) + ",";
-      json += "\"middle\":" + String(Middle) + ",";
-      json += "\"treble\":" + String(Treble) + ",";
-      json += "\"gain\":" + String(Gain) + ",";
-      json += "\"balance\":" + String(Balance) + "}";
-      server.send(200, "application/json", json);
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
       return;
     } else {
       server.send(400, "text/plain", "Invalid source");
@@ -3873,10 +6459,7 @@ void handleSource() {
 
 // Frequency
 void handleFreq() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
-    return;
-  }
+  if (webRejectIfStandby(server)) return;
   if (server.method() == HTTP_POST && server.hasArg("value")) {
     float f = server.arg("value").toFloat();
 
@@ -3890,7 +6473,8 @@ void handleFreq() {
       pendingFreq = f;
       freqApplyPending = true;
       lastWebFreqChange = millis();
-      server.send(200, "text/plain", String(f, 2));
+      // Same shape as /api/v2/* — lighter than sendStatusJson (smaller body, less sendContent work).
+      webSendStateV2(server);
     } else {
       server.send(400, "text/plain", "Invalid frequency");
     }
@@ -3903,6 +6487,7 @@ void handleFreq() {
 
 // EQ
 void handleEQ() {
+  if (webRejectIfStandby(server)) return;
   bool changed = false;
   if (server.hasArg("bass")) {
     int bass = server.arg("bass").toInt();
@@ -3932,23 +6517,26 @@ void handleEQ() {
   if (changed) {
     eqApplyPending = true;
   }
-  server.send(200, "text/plain", "OK");
+  webBeginJsonStream(server);
+  sendStatusJson(server);
+  webEndStream(server);
 }
 
 // Seek
 void handleSeek() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
-    return;
-  }
+  if (webRejectIfStandby(server)) return;
   if (server.method() == HTTP_POST && server.hasArg("dir")) {
     String dir = server.arg("dir");
     if (dir == "up") {
       pendingSeekDir = 1;
-      server.send(200, "text/plain", "Seek up");
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     } else if (dir == "down") {
       pendingSeekDir = -1;
-      server.send(200, "text/plain", "Seek down");
+      webBeginJsonStream(server);
+      sendStatusJson(server);
+      webEndStream(server);
     } else {
       server.send(400, "text/plain", "Invalid dir");
     }
@@ -3959,112 +6547,113 @@ void handleSeek() {
 
 // Raspberry PI serial commands
 void handleRpi() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
+  if (webRejectIfStandby(server)) return;
+  if (!(fmRadio.sursa == 3 && !pcdMode)) {
+    webSendConflict(server, "RPi controls are only available in RPI source");
     return;
   }
+  // A direct command implies user intent: arm bridge even if it was kept off after boot.
+  rpiBridgeArmed = true;
   if (server.method() != HTTP_POST || !server.hasArg("cmd")) {
-    server.send(400, "text/plain", "Missing cmd argument");
+    webSendBadRequest(server, "Missing cmd argument");
     return;
   }
 
   String cmd = server.arg("cmd");
   cmd.toUpperCase();
   if (cmd == "PREV" || cmd == "NEXT" || cmd == "PLAYPAUSE" || cmd == "GET") {
-    sendRpiCommand(cmd.c_str());
-    server.send(200, "text/plain", "OK");
+#if defined(ARDUINO_ARCH_ESP32)
+    setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), cmd.c_str(), &rpiWebCmdMux);
+#else
+    setPendingCommand(rpiWebCmdPending, rpiWebCmdBuf, sizeof(rpiWebCmdBuf), cmd.c_str());
+#endif
+    rpiWebCmdNextTryMs = 0;
+    webSendJsonOk(server);
     return;
   }
 
-  server.send(400, "text/plain", "Invalid cmd");
+  webSendBadRequest(server, "Invalid cmd");
+}
+
+// PC (foobar) LAN commands
+void handlePc() {
+  if (webRejectIfStandby(server)) return;
+  if (!(fmRadio.sursa == 4 || fmRadio.sursa == 5)) {
+    webSendConflict(server, "PC controls are only available in PCA/PCD");
+    return;
+  }
+  if (server.method() != HTTP_POST || !server.hasArg("cmd")) {
+    webSendBadRequest(server, "Missing cmd argument");
+    return;
+  }
+  String cmd = server.arg("cmd");
+  cmd.toUpperCase();
+  if (cmd == "PREV" || cmd == "NEXT" || cmd == "PLAYPAUSE" || cmd == "PLAY" || cmd == "PAUSE" || cmd == "STOP") {
+#if defined(ARDUINO_ARCH_ESP32)
+    setPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmd.c_str(), &pcWebCmdMux);
+#else
+    setPendingCommand(pcWebCmdPending, pcWebCmdBuf, sizeof(pcWebCmdBuf), cmd.c_str());
+#endif
+    webSendJsonOk(server);
+    return;
+  }
+  webSendBadRequest(server, "Invalid cmd");
 }
 
 // Status (all info)
 void handleStatus() {
-  String json;
-  json.reserve(512);
-  json = "{";
-  json += "\"power\":\"" + String(standbyState ? "off" : "on") + "\",";
-  json += "\"mute\":\"" + String(fmRadio.isMuted ? "on" : "off") + "\",";
-  json += "\"volume\":" + String(fmRadio.currentVolume) + ",";
-  json += "\"source\":" + String(fmRadio.sursa) + ",";
-  json += "\"freq\":" + String(fmRadio.currentFrequency, 2) + ",";
-  // Cached SI4703 RSSI from main loop (avoid I2C here)
-  int rssi = (!standbyState && si4703Powered && fmRadio.sursa == 1) ? (int)lastFmRssi : -1;
-  json += "\"rssi\":" + String(rssi) + ",";
-  // Add WiFi RSSI (dBm). If disconnected, return a sentinel like -127.
-  int wifi = -127;
-  if (WiFi.status() == WL_CONNECTED) {
-    wifi = WiFi.RSSI();
+  // Prevent overlapping /status requests from wedging lwIP/WebServer.
+  if (webStatusBusy) {
+    webSendText(server, 503, "busy");
+    return;
   }
-  json += "\"wifi\":" + String(wifi) + ",";
-  // Add RDS RadioText when available
-  String rds = "";
-  if (!standbyState && si4703Powered && fmRadio.sursa == 1) {
-    rds = String(fmRadio.radioTextnow);
-    rds.trim();
-  }
-  // JSON-escape minimal characters
-  String rdsEsc = rds;
-  rdsEsc.replace("\\", "\\\\");
-  rdsEsc.replace("\"", "\\\"");
-  json += "\"rds\":\"" + rdsEsc + "\",";
-  String rpiTitleEsc = rpiTitle;
-  String rpiArtistEsc = rpiArtist;
-  String rpiFileEsc = rpiFile;
-  String rpiStateEsc = rpiState;
-  rpiTitleEsc.replace("\\", "\\\\");
-  rpiTitleEsc.replace("\"", "\\\"");
-  rpiArtistEsc.replace("\\", "\\\\");
-  rpiArtistEsc.replace("\"", "\\\"");
-  rpiFileEsc.replace("\\", "\\\\");
-  rpiFileEsc.replace("\"", "\\\"");
-  rpiStateEsc.replace("\\", "\\\\");
-  rpiStateEsc.replace("\"", "\\\"");
-  json += "\"rpiOnline\":" + String(rpiConnected ? "true" : "false") + ",";
-  json += "\"rpiState\":\"" + rpiStateEsc + "\",";
-  json += "\"rpiTitle\":\"" + rpiTitleEsc + "\",";
-  json += "\"rpiArtist\":\"" + rpiArtistEsc + "\",";
-  json += "\"rpiFile\":\"" + rpiFileEsc + "\",";
-  json += "\"bass\":" + String(Bass) + ",";
-  json += "\"middle\":" + String(Middle) + ",";
-  json += "\"treble\":" + String(Treble) + ",";
-  json += "\"gain\":" + String(Gain) + ",";
-  json += "\"balance\":" + String(Balance) + "}";
-  server.send(200, "application/json", json);
+  webStatusBusy = true;
+  // Always clear the busy flag even if client disconnects mid-stream.
+  webBeginJsonStream(server);
+  sendStatusJson(server);
+  webEndStream(server);
+  webStatusBusy = false;
 }
 
 // System info pentru standby UI - foloseste doar cache (fara I2C in handler ca sa nu blocheze web UI)
 void handleSystemInfo() {
-  int wifiRssi = -127;
-  String wifiSsid = "";
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiRssi = WiFi.RSSI();
-    wifiSsid = WiFi.SSID();
+  if (webSystemInfoBusy) {
+    webSendText(server, 503, "busy");
+    return;
   }
+  webSystemInfoBusy = true;
+  int wifiRssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -127;
+  String wifiSsid = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : "";
   String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "-";
   unsigned long uptimeSec = millis() / 1000;
   uint32_t freeHeap = ESP.getFreeHeap();
 
-  String ssidEsc = wifiSsid;
-  ssidEsc.replace("\\", "\\\\");
-  ssidEsc.replace("\"", "\\\"");
+  webBeginJsonStream(server);
 
-  String json;
-  json.reserve(320);
-  json = "{";
-  json += "\"ip\":\"" + ip + "\",";
-  json += "\"wifiRssi\":" + String(wifiRssi) + ",";
-  json += "\"wifiSsid\":\"" + ssidEsc + "\",";
-  json += "\"i2c\":{";
-  json += "\"TDA7439\":" + String(cachedTdaOk ? "true" : "false") + ",";
-  json += "\"RTC_DS3231\":" + String(cachedRtcOk ? "true" : "false") + ",";
-  json += "\"MCP23017\":" + String(cachedMcpOk ? "true" : "false") + ",";
-  json += "\"mcpAddr\":\"" + String(cachedMcpOk && mcpI2cAddr != 0 ? ("0x" + String(mcpI2cAddr, HEX)) : "-") + "\",";
-  json += "\"SI4703\":" + String(cachedSi47Ok ? "true" : "false") + "},";
-  json += "\"freeHeap\":" + String(freeHeap) + ",";
-  json += "\"uptimeSec\":" + String(uptimeSec) + "}";
-  server.send(200, "application/json", json);
+  server.sendContent("{");
+  server.sendContent("\"ip\":"); sendJsonEscapedContent(server, ip.c_str()); server.sendContent(",");
+  server.sendContent("\"wifiRssi\":"); sendContentInt(server, (long)wifiRssi); server.sendContent(",");
+  server.sendContent("\"wifiSsid\":"); sendJsonEscapedContent(server, wifiSsid.c_str()); server.sendContent(",");
+  server.sendContent("\"i2c\":{");
+  server.sendContent("\"TDA7439\":"); server.sendContent(cachedTdaOk ? "true" : "false"); server.sendContent(",");
+  server.sendContent("\"RTC_DS3231\":"); server.sendContent(cachedRtcOk ? "true" : "false"); server.sendContent(",");
+  server.sendContent("\"MCP23017\":"); server.sendContent(cachedMcpOk ? "true" : "false"); server.sendContent(",");
+  server.sendContent("\"mcpAddr\":");
+  if (cachedMcpOk && mcpI2cAddr != 0) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "0x%02X", (unsigned)mcpI2cAddr);
+    sendJsonEscapedContent(server, buf);
+  } else {
+    server.sendContent("\"-\"");
+  }
+  server.sendContent(",");
+  server.sendContent("\"SI4703\":"); server.sendContent(cachedSi47Ok ? "true" : "false");
+  server.sendContent("},");
+  server.sendContent("\"freeHeap\":"); sendContentInt(server, (long)freeHeap); server.sendContent(",");
+  server.sendContent("\"uptimeSec\":"); sendContentInt(server, (long)uptimeSec);
+  server.sendContent("}");
+  webEndStream(server);
+  webSystemInfoBusy = false;
 }
 
 // Draw a red underline under the selected source button in util mode
@@ -4098,32 +6687,48 @@ void drawUtilSourceUnderline(int sursa) {
 // POST /preset?id=1&freq=99.5&name=RockFM: sets preset 1 to 99.5 MHz and name 'RockFM'
 // GET /preset?id=1: returns {"freq":..., "name":...} for preset 1
 void handlePresets() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
+  if (webRejectIfStandby(server)) return;
+  if (webPresetsBusy) {
+    webSendText(server, 503, "busy");
     return;
   }
+  webPresetsBusy = true;
   preferences.begin("settings", true);
-  String json;
-  json.reserve(512);
-  json = "[";
-  for (int i = 1; i <= 9; ++i) {
-    String keyFreq = "preset" + String(i) + "_freq";
-    String keyName = "preset" + String(i) + "_name";
-    float freq = preferences.getFloat(keyFreq.c_str(), 0.0);
-    String name = preferences.getString(keyName.c_str(), "");
-    json += "{\"freq\":" + String(freq, 2) + ",\"name\":\"" + name + "\"}";
-    if (i < 9) json += ",";
+  webBeginJsonStream(server);
+  server.sendContent("[");
+  for (int i = 1; i <= 10; ++i) {
+    if (i > 1) server.sendContent(",");
+    char keyFreq[24], keyName[24];
+    snprintf(keyFreq, sizeof(keyFreq), "preset%d_freq", i);
+    snprintf(keyName, sizeof(keyName), "preset%d_name", i);
+
+    // Back-compat: MEM1..MEM6 were historically stored as p0f..p5f (float MHz).
+    // Prefer the new `preset*_freq` if present; otherwise fall back to `p*f`.
+    float freq = preferences.getFloat(keyFreq, 0.0f);
+    if (freq <= 0.0f && i >= 1 && i <= 6) {
+      const int idx = i - 1;
+      String legacyKey = "p" + String(idx) + "f";
+      freq = preferences.getFloat(legacyKey.c_str(), 0.0f);
+    }
+
+    String name = preferences.getString(keyName, "");
+    if (name.length() == 0 && i >= 1 && i <= 6) {
+      name = "MEM" + String(i);
+    }
+    server.sendContent("{\"freq\":");
+    sendContentFloat2(server, (double)freq);
+    server.sendContent(",\"name\":");
+    sendJsonEscapedContent(server, name.c_str());
+    server.sendContent("}");
   }
   preferences.end();
-  json += "]";
-  server.send(200, "application/json", json);
+  server.sendContent("]");
+  webEndStream(server);
+  webPresetsBusy = false;
 }
 
 void handlePreset() {
-  if (standbyState) {
-    server.send(403, "text/plain", "Device is in standby");
-    return;
-  }
+  if (webRejectIfStandby(server)) return;
   if (server.method() == HTTP_POST && server.hasArg("id") && server.hasArg("freq") && server.hasArg("name")) {
     int id = server.arg("id").toInt();
     float freq = server.arg("freq").toFloat();
@@ -4137,6 +6742,16 @@ void handlePreset() {
     preferences.begin("settings", false);
     preferences.putFloat(keyFreq.c_str(), freq);
     preferences.putString(keyName.c_str(), name);
+
+    // Back-compat: mirror preset1..6 into legacy MEM storage (p0f..p5f) used by MCP buttons.
+    if (id >= 1 && id <= 6) {
+      const int idx = id - 1;
+      String legacyKey = "p" + String(idx) + "f";
+      preferences.putFloat(legacyKey.c_str(), freq);
+      // Keep runtime behavior consistent without requiring reboot:
+      // update the in-RAM preset array used by MCP short-press recall.
+      fmRadio.sensor1MemFreq[idx] = freq;
+    }
     preferences.end();
     server.send(200, "text/plain", "OK");
   } else if (server.method() == HTTP_GET && server.hasArg("id")) {
@@ -4149,7 +6764,15 @@ void handlePreset() {
     String keyName = "preset" + String(id) + "_name";
     preferences.begin("settings", true);
     float freq = preferences.getFloat(keyFreq.c_str(), 0.0);
+    if (freq <= 0.0f && id >= 1 && id <= 6) {
+      const int idx = id - 1;
+      String legacyKey = "p" + String(idx) + "f";
+      freq = preferences.getFloat(legacyKey.c_str(), 0.0f);
+    }
     String name = preferences.getString(keyName.c_str(), "");
+    if (name.length() == 0 && id >= 1 && id <= 6) {
+      name = "MEM" + String(id);
+    }
     preferences.end();
     String json = "{\"freq\":" + String(freq, 2) + ",\"name\":\"" + name + "\"}";
     server.send(200, "application/json", json);
@@ -4214,14 +6837,14 @@ bool resetSI4703Hardware() {
 
 // Full re-init that recovers the I2C bus, hardware‑resets the SI4703 and reconfigures the radio object.
 bool reinitSI4703() {
-  Serial.println("[SI4703] Reinitializing after power cycle...");
+  // Serial.println("[SI4703] Reinitializing after power cycle...");
   i2cBusRecover();
   // Perform hardware reset to guarantee 2-wire mode after rail power-up
   resetSI4703Hardware();
   // Verify presence
   si4703Powered = detectSI4703();
   if (!si4703Powered) {
-    Serial.println("[SI4703] Not detected after reset; skipping radio init.");
+    // Serial.println("[SI4703] Not detected after reset; skipping radio init.");
     return false;
   }
   // Re-run library init/config
@@ -4229,7 +6852,7 @@ bool reinitSI4703() {
   fmRadio.radio.setFrequency(fmRadio.currentFrequency * 100);
   fmRadio.radio.setVolume(fmRadio.currentVolume);
   fmRadio.radio.attachReceiveRDS(FMRadioController::RDS_process);
-  Serial.println("[SI4703] Reinit complete.");
+  // Serial.println("[SI4703] Reinit complete.");
   return true;
 }
 
@@ -4301,22 +6924,49 @@ void testTDA7439Comms() {
 void setTDA7439InputForSource(int sursa) {
   int tdaInput = 1;
   switch (sursa) {
-    case 4: tdaInput = 1; break; // PC -> IN1
+    case 4:
+      // PCA (PC) = IN1
+      tdaInput = 1;
+      break;
+    case 5:
+      // PCD (Foobar) = IN3 (legacy PC analog path on TDA7439)
+      tdaInput = 3;
+      break;
     case 2: tdaInput = 2; break; // BT -> IN2
-    case 1: tdaInput = 4; break; // Radio (TUN) -> IN3
-    case 3: tdaInput = 3; break; // RPI -> IN4
+    case 1: tdaInput = 4; break; // TUN (unchanged)
+    case 3:
+      // RPi = IN3
+      tdaInput = 3;
+      break;
     default: tdaInput = 1; break;
   }
+  // Optional external mux/relay for PC routing (XMOS vs analog).
+  if (PC_AUDIO_SEL_PIN >= 0) {
+    const bool wantAnalog = (sursa == 5); // PCD = analog path
+    const bool level = PC_AUDIO_SEL_ACTIVE_HIGH ? wantAnalog : !wantAnalog;
+    digitalWrite(PC_AUDIO_SEL_PIN, level ? HIGH : LOW);
+  }
+  if (PC_DIGITAL_STATUS_PIN >= 0) {
+    const bool wantAmanero = (sursa == 5); // PCD => Amanero, everything else (incl. RPI) => Raspberry
+    const bool level = PC_DIGITAL_STATUS_AMANERO_LEVEL_HIGH ? wantAmanero : !wantAmanero;
+    digitalWrite(PC_DIGITAL_STATUS_PIN, level ? HIGH : LOW);
+  }
   tda7439.setInput(tdaInput);
+  noteTdaWrite("input", tdaInput, -1);
 }
 
 // Apply all persisted audio settings to TDA7439 for current source
 void applyTDA7439SettingsForCurrentSource() {
+  // #region agent log: H9 measure TDA7439 apply cost (includes deliberate delays)
+  uint32_t applyT0 = micros();
+  // #endregion
   Wire.beginTransmission(0x44);
   byte error = Wire.endTransmission();
   if (error != 0) {
-    Serial.print("[TDA7439] Apply settings error: ");
-    Serial.println(error);
+    // if (Serial.availableForWrite() >= 64) {
+    //   Serial.print("[TDA7439] Apply settings error: ");
+    //   Serial.println(error);
+    // }
     return;
   }
   setTDA7439InputForSource(fmRadio.sursa);
@@ -4324,8 +6974,10 @@ void applyTDA7439SettingsForCurrentSource() {
   // Apply gain first, then tone, then volume
   int tdaGain = (Gain + 45) / 3; // 0..15
   tda7439.inputGain(tdaGain);
-  Serial.print("[TDA7439] Applying input gain: ");
-  Serial.println(tdaGain);
+  // if (Serial.availableForWrite() >= 96) {
+  //   Serial.print("[TDA7439] Applying input gain: ");
+  //   Serial.println(tdaGain);
+  // }
   delay(2);
   tda7439.setSnd(Bass, 1);
   delay(2);
@@ -4333,12 +6985,23 @@ void applyTDA7439SettingsForCurrentSource() {
   delay(2);
   tda7439.setSnd(Treble, 3);
   delay(2);
-  tda7439.setVolume(fmRadio.currentVolume);
+  // Respect UI mute state: re-apply should not accidentally "unmute" audio.
+  {
+    const int v = fmRadio.isMuted ? 0 : (int)fmRadio.currentVolume;
+    tda7439.setVolume(v);
+    noteTdaWrite("apply", -1, v);
+  }
   delay(2);
   tda7439.spkAtt(0);
   delay(2);
   setTDA7439Balance((int8_t)Balance);
-  Serial.println("[TDA7439] Applied saved input/volume/EQ/gain/balance");
+  // if (Serial.availableForWrite() >= 96) {
+  //   Serial.println("[TDA7439] Applied saved input/volume/EQ/gain/balance");
+  // }
+  // #region agent log: H9 measure TDA7439 apply cost (includes deliberate delays)
+  uint32_t applyDt = micros() - applyT0;
+  if (applyDt > profApplyTdaUsMax) profApplyTdaUsMax = applyDt;
+  // #endregion
 }
 
 
@@ -4362,7 +7025,7 @@ void setTDA7439Treble(int8_t treble) {
   if (treble < -7) treble = -7;
   if (treble > 7)  treble = 7;
   uint8_t val = (treble < 0) ? (abs(treble) | 0x08) : treble;
-  tda7439Send(0x03, val & 0x0F); // 0x03 = treble
+  tda7439Send(0x03, val & 0x0F); // 0x03 = treblein continuare
 }
 
 
@@ -4397,3 +7060,4 @@ void tda7439Send(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
   delay(2);
 }
+
